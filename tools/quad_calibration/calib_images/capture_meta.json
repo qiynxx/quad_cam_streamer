@@ -1,0 +1,28 @@
+{
+  "num_frame_sets": 42,
+  "cameras": [
+    {
+      "index": 0,
+      "name": "imx334_0"
+    },
+    {
+      "index": 1,
+      "name": "imx334_1"
+    },
+    {
+      "index": 2,
+      "name": "ov9281_0"
+    },
+    {
+      "index": 3,
+      "name": "ov9281_1"
+    }
+  ],
+  "board": {
+    "type": "chessboard",
+    "cols": 11,
+    "rows": 8,
+    "square_size_mm": 25.0
+  },
+  "capture_date": "2026-03-20T22:28:05.879483"
+}

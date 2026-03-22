@@ -1,0 +1,4 @@
+pyzmq
+opencv-python
+numpy
+pyyaml

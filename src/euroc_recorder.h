@@ -1,0 +1,116 @@
+#pragma once
+
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <fstream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "audio_player.h"
+#include "config.h"
+#include "imu_reader.h"
+
+class EurocRecorder {
+public:
+    EurocRecorder(const AppConfig &cfg, AudioPlayer *audio = nullptr);
+    ~EurocRecorder();
+
+    bool is_recording() const { return recording_.load(std::memory_order_relaxed); }
+
+    // Called from camera threads - enqueues JPEG data into ring buffer
+    void push_frame(int cam_index, uint64_t timestamp_ns,
+                    const uint8_t *jpeg_data, size_t jpeg_size);
+
+    // Called from IMU thread - enqueues IMU sample
+    void push_imu(const ImuSample &sample);
+
+    // Toggle recording on/off (called from key monitor)
+    bool toggle_recording();
+
+    // Stop recording if active
+    void stop();
+
+    int num_cameras() const { return num_cameras_; }
+
+private:
+    // Ring buffer depth per camera. At 30fps, 300 frames = 10 seconds of buffering.
+    // Large buffer needed because FFmpeg pipe writes can block on SD card I/O.
+    static constexpr int RING_BUF_SIZE = 300;
+    static constexpr int IMU_QUEUE_SIZE = 600;
+    static constexpr int STATS_INTERVAL = 30;  // log every N groups
+
+    struct FrameEntry {
+        uint64_t timestamp_ns = 0;
+        std::vector<uint8_t> jpeg;
+    };
+
+    bool start_recording();
+    void stop_recording();
+    void writer_thread_func();
+    bool try_group_and_write();
+    void write_grouped_frames(uint64_t avg_ts, std::vector<FrameEntry> &frames);
+    void drain_imu();
+    void disk_writer_thread_func();
+    bool is_sd_mounted() const;
+    void write_body_yaml(const std::string &base_dir);
+    void copy_sensor_yaml(const std::string &src, const std::string &dst);
+
+    const AppConfig &cfg_;
+    AudioPlayer *audio_ = nullptr;
+    int num_cameras_ = 0;
+    uint64_t match_window_ns_ = 33333333;  // default 1 frame @ 30fps
+    std::vector<int> enabled_indices_;      // config indices of enabled cameras
+    std::atomic<bool> recording_{false};
+    std::mutex toggle_mtx_;  // prevent concurrent toggle_recording() calls
+
+    // Session directory
+    std::string session_dir_;
+
+    // Per-camera ring buffers
+    struct CamRing {
+        std::mutex mtx;
+        std::deque<FrameEntry> buf;
+    };
+    std::vector<std::unique_ptr<CamRing>> cam_rings_;
+
+    // Wake writer when new frame arrives
+    std::mutex wake_mtx_;
+    std::condition_variable wake_cv_;
+
+    // IMU queue
+    std::mutex imu_mtx_;
+    std::deque<ImuSample> imu_queue_;
+
+    // CSV file handles
+    std::vector<std::ofstream> cam_csv_;
+    std::ofstream imu_csv_;
+
+    // Video recording (FFmpeg pipes)
+    std::vector<FILE*> video_pipes_;
+
+    // Writer thread
+    std::thread writer_thread_;
+    std::atomic<bool> writer_running_{false};
+
+    // Async disk writer
+    struct WriteTask {
+        int cam_idx;
+        uint64_t timestamp_ns;
+        std::vector<uint8_t> jpeg;
+        std::string csv_line;
+    };
+    std::deque<WriteTask> write_queue_;
+    std::mutex write_queue_mtx_;
+    std::condition_variable write_queue_cv_;
+    std::thread disk_writer_thread_;
+    std::atomic<bool> disk_writer_running_{false};
+
+    // Stats
+    uint64_t groups_written_ = 0;
+    uint64_t frames_dropped_ = 0;
+};

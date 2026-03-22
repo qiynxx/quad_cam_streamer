@@ -1,0 +1,109 @@
+{
+  "stream": {
+    "host": "192.168.100.6",
+    "base_port": 5550,
+    "jpeg_quality": 95
+  },
+  "cameras": [
+    {
+      "name": "m01_b_imx334 5-0036",
+      "enabled": true,
+      "device": "/dev/video53",
+      "subdev": "/dev/v4l-subdev8",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "format": "NV12",
+      "rotate_180": false,
+      "mirror": false,
+      "auto_exposure": true,
+      "exposure_us": 2000,
+      "analogue_gain": 16,
+      "use_rkaiq": false,
+      "sensor_entity_name": "m01_b_imx334 5-0036",
+      "iq_file_dir": "/etc/iqfiles"
+    },
+    {
+      "name": "m00_b_imx334 4-001a",
+      "enabled": true,
+      "device": "/dev/video44",
+      "subdev": "/dev/v4l-subdev3",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "format": "NV12",
+      "rotate_180": true,
+      "mirror": false,
+      "auto_exposure": true,
+      "exposure_us": 2000,
+      "analogue_gain": 16,
+      "use_rkaiq": false,
+      "sensor_entity_name": "m00_b_imx334 4-001a",
+      "iq_file_dir": "/etc/iqfiles"
+    },
+    {
+      "name": "m02_b_ov9281 8-0060",
+      "enabled": true,
+      "device": "/dev/video62",
+      "subdev": "/dev/v4l-subdev13",
+      "width": 1280,
+      "height": 800,
+      "fps": 30,
+      "format": "NV12",
+      "rotate_180": false,
+      "mirror": true,
+      "auto_exposure": false,
+      "exposure_us": 1000,
+      "analogue_gain": 16,
+      "use_rkaiq": false,
+      "sensor_entity_name": "m02_b_ov9281 8-0060",
+      "iq_file_dir": "/etc/iqfiles"
+    },
+    {
+      "name": "m03_b_ov9281 9-0060",
+      "enabled": true,
+      "device": "/dev/video71",
+      "subdev": "/dev/v4l-subdev18",
+      "width": 1280,
+      "height": 800,
+      "fps": 30,
+      "format": "NV12",
+      "rotate_180": true,
+      "mirror": true,
+      "auto_exposure": false,
+      "exposure_us": 1000,
+      "analogue_gain": 16,
+      "use_rkaiq": false,
+      "sensor_entity_name": "m03_b_ov9281 9-0060",
+      "iq_file_dir": "/etc/iqfiles"
+    }
+  ],
+  "imu": {
+    "enabled": true,
+    "i2c_device": "/dev/i2c-3",
+    "i2c_addr": 107,
+    "sampling_frequency": 208,
+    "accel_range": 4,
+    "gyro_range": 1000,
+    "zmq_port": 5560,
+    "rotation_matrix": [
+      [ 0, 0, -1],
+      [ 0, 1,  0],
+      [ 1, 0,  0]
+    ]
+  },
+  "recording": {
+    "enabled": true,
+    "sd_mount_path": "/mnt/sdcard/SD",
+    "calib_dir": "/etc/quad_cam_streamer/calib",
+    "record_key_code": 115,
+    "input_device": "",
+    "output_format": "video",
+    "video_codec": "mjpeg",
+    "video_bitrate_mbps": 10
+  },
+  "hardware_sync": {
+    "enabled": true,
+    "fps": 30
+  }
+}

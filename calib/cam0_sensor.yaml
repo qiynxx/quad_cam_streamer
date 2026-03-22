@@ -1,0 +1,47 @@
+sensor_type: camera
+comment: imx334_0 - reference camera (body frame)
+T_BS:
+  cols: 4
+  rows: 4
+  data:
+  - 1
+  - 0
+  - 0
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - 0
+  - 0
+  - 1
+  - 0
+  - 0
+  - 0
+  - 0
+  - 1
+rate_hz: 30
+resolution:
+- 1920
+- 1080
+camera_model: pinhole
+intrinsics:
+- 687.0056444314067
+- 686.8330455568179
+- 979.3901540379519
+- 540.1765319571168
+distortion_model: radial-tangential
+distortion_coefficients:
+- -0.005036702709750205
+- -0.010777679468067515
+- -0.0003147080201137564
+- 0.0001755085409434836
+calibration_resolution:
+- 1920
+- 1080
+intrinsics_normalized:
+- 0.3578154398080243
+- 0.6359565236637202
+- 0.5100990385614332
+- 0.500163455515849
+intrinsic_rms_error: 0.198373

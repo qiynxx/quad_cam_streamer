@@ -1,0 +1,33 @@
+#!/bin/sh
+
+DAEMON=/usr/bin/quad_cam_streamer
+CONFIG=/etc/quad_cam_streamer/config.json
+PIDFILE=/var/run/quad_cam_streamer.pid
+
+case "$1" in
+  start)
+    echo "Starting quad_cam_streamer..."
+    # Unmute ES8388 codec outputs (mixer state is not persisted across reboots)
+    amixer -q sset 'Master' 50% unmute 2>/dev/null || true
+    # Avoid rkaiq lock contention on boot
+    killall rkaiq_3A_server rkaiq_tool_server 2>/dev/null
+    rm -f /tmp/aiq*.lock
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- "$CONFIG"
+    ;;
+  stop)
+    echo "Stopping quad_cam_streamer..."
+    start-stop-daemon -K -p "$PIDFILE" -x "$DAEMON"
+    rm -f "$PIDFILE"
+    ;;
+  restart)
+    $0 stop
+    sleep 1
+    $0 start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac
+
+exit 0

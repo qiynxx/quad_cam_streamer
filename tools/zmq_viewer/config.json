@@ -1,0 +1,12 @@
+{
+  "host": "192.168.100.1",
+  "base_port": 5550,
+  "cell_width": 640,
+  "imu_port": 5560,
+  "cameras": [
+    { "index": 0, "name": "imx334_0", "enabled": true },
+    { "index": 1, "name": "imx334_1", "enabled": true },
+    { "index": 2, "name": "ov9281_0", "enabled": true },
+    { "index": 3, "name": "ov9281_1", "enabled": true }
+  ]
+}
