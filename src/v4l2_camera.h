@@ -20,6 +20,8 @@ public:
     bool refresh_format();
 
     void set_exposure(bool auto_exp, int exposure_us, int gain);
+    void set_line_time_us(float lt) { line_time_us_ = lt; }
+    float line_time_us() const { return line_time_us_; }
     void open_subdev(const std::string &subdev_path);
     float get_brightness(const uint8_t *nv12_data);  // Calculate brightness from NV12 frame
     void list_controls();  // List all available V4L2 controls
@@ -42,6 +44,7 @@ private:
 
     int fd_ = -1;
     int subdev_fd_ = -1;  // sensor subdev for exposure/gain control
+    float line_time_us_ = 15.0f;  // microseconds per line (IMX334≈14.8, OV9281≈9.1)
     int width_ = 0;
     int height_ = 0;
     int stride_ = 0;

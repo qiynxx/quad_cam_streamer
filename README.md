@@ -18,7 +18,8 @@ Each camera runs in its own thread. Each gets a dedicated ZMQ PUB port:
 
 ```
 app/quad_cam_streamer/
-├── build.sh                       # 一键编译脚本
+├── build.sh                       # 一键编译脚本（通过 Buildroot）
+├── build_local.sh                 # 本地交叉编译脚本（直接 CMake）
 ├── CMakeLists.txt                 # CMake 构建配置
 ├── config.json                    # 默认配置文件
 ├── S99quad_cam_streamer           # SysV 开机自启脚本
@@ -39,6 +40,115 @@ app/quad_cam_streamer/
 - Board: Purple Pi OH2 with 4 cameras connected (2x IMX334 + 2x OV9281)
 - Camera pipeline configured in device tree
 - rkaiq_3A_server running (for auto-exposure)
+
+## 编译依赖安装
+
+编译 `quad_cam_streamer` 需要完成以下三个阶段的依赖准备。
+
+### 1. 主机工具链（Ubuntu/Debian）
+
+```bash
+sudo apt update
+sudo apt install -y \
+    build-essential gcc g++ make \
+    cmake \
+    git \
+    python3 python-is-python3 \
+    device-tree-compiler \
+    bc flex bison \
+    libssl-dev \
+    file \
+    unzip rsync cpio \
+    android-tools-adb     # 可选，用于 adb push 部署到板子
+```
+
+> 如果使用其他发行版，请安装等效的包。Buildroot 的完整主机依赖可参考 [Buildroot 官方文档](https://buildroot.org/downloads/manual/manual.html#requirement)。
+
+### 2. SDK 初始化
+
+首次获取 SDK 后，需要先完成一次完整构建以初始化 Buildroot 交叉编译环境：
+
+```bash
+cd rk3576_purple_pi_oh2_linux_sdk
+
+# 加载板级配置
+./build.sh rockchip_rk3576_ido_evb7609_v1_hdmi_defconfig
+
+# 完整构建（生成 toolchain + sysroot + rootfs）
+./build.sh all
+```
+
+构建完成后，以下目录应当存在：
+
+| 路径 | 说明 |
+|------|------|
+| `buildroot/output/rockchip_rk3576/host/` | 交叉编译工具链 (aarch64-buildroot-linux-gnu-g++) |
+| `buildroot/output/rockchip_rk3576/host/aarch64-buildroot-linux-gnu/sysroot/` | 目标系统 sysroot |
+| `buildroot/output/rockchip_rk3576/host/share/buildroot/toolchainfile.cmake` | CMake 工具链文件 |
+
+### 3. Buildroot 目标库（交叉编译依赖）
+
+项目依赖以下 Buildroot 包，需要在 sysroot 中编译安装：
+
+| Buildroot 包名 | 用途 | 类型 |
+|----------------|------|------|
+| `camera-engine-rkaiq` | Rockchip ISP 3A 引擎 (librkaiq) | 动态库 |
+| `rockchip_mpp` | Rockchip 硬件编解码 (MPP) | 动态库 |
+| `zeromq` | ZMQ 消息传输库 (libzmq) | 动态库 |
+| `cppzmq` | ZMQ C++ 头文件封装 | 仅头文件 |
+| `json-for-modern-cpp` | nlohmann/json JSON 解析 | 仅头文件 |
+| `alsa-lib` | ALSA 音频库 (libasound) | 动态库 |
+
+**使用一键脚本安装**（推荐）：
+
+```bash
+cd app/quad_cam_streamer
+./build.sh init
+```
+
+`init` 命令会自动在 Buildroot `.config` 中启用上述包，运行 `make olddefconfig`，然后逐一编译。
+
+**手动安装**：
+
+```bash
+cd buildroot/output/rockchip_rk3576
+
+# 启用缺失的包（如果 .config 中没有）
+# 在 .config 中设置：
+#   BR2_PACKAGE_CAMERA_ENGINE_RKAIQ=y
+#   BR2_PACKAGE_JSON_FOR_MODERN_CPP=y
+#   BR2_PACKAGE_ZEROMQ=y
+#   BR2_PACKAGE_CPPZMQ=y
+make olddefconfig
+
+# 逐一编译依赖
+make camera-engine-rkaiq
+make zeromq
+make cppzmq
+make json-for-modern-cpp
+```
+
+> `rockchip_mpp` 和 `alsa-lib` 通常在 SDK 完整构建时已经编译，无需额外操作。
+
+### 依赖验证
+
+可通过以下命令检查依赖是否就绪：
+
+```bash
+SYSROOT=buildroot/output/rockchip_rk3576/host/aarch64-buildroot-linux-gnu/sysroot
+
+# 检查库文件
+ls $SYSROOT/usr/lib/librkaiq.so        # rkaiq
+ls $SYSROOT/usr/lib/librockchip_mpp.so # MPP
+ls $SYSROOT/usr/lib/libzmq.so          # ZeroMQ
+ls $SYSROOT/usr/lib/libasound.so       # ALSA
+
+# 检查头文件
+ls $SYSROOT/usr/include/rkaiq/         # rkaiq headers
+ls $SYSROOT/usr/include/rockchip/      # MPP headers
+ls $SYSROOT/usr/include/zmq.hpp        # cppzmq header
+ls $SYSROOT/usr/include/nlohmann/json.hpp  # nlohmann_json header
+```
 
 ## Build
 
@@ -90,7 +200,28 @@ cd app/quad_cam_streamer
 | `config.json` | `/etc/quad_cam_streamer/` | 默认配置文件 |
 | `S99quad_cam_streamer` | `/etc/init.d/` | 开机自启脚本 |
 
-### 手动编译（底层命令）
+### 本地交叉编译（build_local.sh）
+
+`build_local.sh` 直接调用 CMake + Buildroot 工具链交叉编译，**不经过 Buildroot 的 make 系统**，编译速度更快，适合频繁修改代码时使用。可执行文件直接输出到当前目录。
+
+> 前提：已完成上方「编译依赖安装」中的全部三个阶段。
+
+```bash
+cd app/quad_cam_streamer
+
+./build_local.sh            # 增量编译（默认）
+./build_local.sh rebuild    # 清理后重新编译
+./build_local.sh debug      # 编译带调试符号的版本
+./build_local.sh push       # 编译 + adb push 到板子
+./build_local.sh clean      # 清理构建产物
+./build_local.sh configure  # 仅运行 CMake 配置
+```
+
+编译产物：
+- `./quad_cam_streamer` — 可执行文件（aarch64 ELF）
+- `./build/compile_commands.json` — 供 IDE 代码补全和跳转使用
+
+### 手动编译（Buildroot 底层命令）
 
 如果不使用一键脚本，也可以手动操作：
 

@@ -135,6 +135,15 @@ static void camera_thread(int index, const CameraConfig &cam_cfg,
     }
 
     camera.open_subdev(cam_cfg.subdev);
+
+    if (cam_cfg.sensor_entity_name.find("ov9281") != std::string::npos ||
+        cam_cfg.sensor_entity_name.find("ov9282") != std::string::npos) {
+        camera.set_line_time_us(9.1f);   // OV9281/9282: HTS=728, VTS=3656 @30fps
+    } else {
+        camera.set_line_time_us(14.8f);  // IMX334: HMAX=1100, INCK=74.25MHz
+    }
+    fprintf(stderr, "[cam%d] Line time: %.1f us/line\n", index, camera.line_time_us());
+
     camera.list_controls();
 
     // Initialize rkaiq if enabled

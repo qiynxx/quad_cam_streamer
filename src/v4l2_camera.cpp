@@ -227,14 +227,9 @@ void V4L2Camera::set_exposure(bool auto_exp, int exposure_us, int gain)
 
     struct v4l2_control ctrl = {};
 
-    // IMX334/OV9281 don't support V4L2_CID_EXPOSURE_AUTO, skip it
-    // Manual exposure is always used
-
     if (!auto_exp) {
-        // Convert exposure from microseconds to lines
-        // Line time ≈ 15us for IMX334@30fps, 33us for OV9281@30fps
-        // Approximate: exposure_lines = exposure_us / 15
-        int exposure_lines = exposure_us / 15;
+        int exposure_lines = (int)(exposure_us / line_time_us_ + 0.5f);
+        if (exposure_lines < 1) exposure_lines = 1;
 
         ctrl.id = V4L2_CID_EXPOSURE;
         ctrl.value = exposure_lines;
