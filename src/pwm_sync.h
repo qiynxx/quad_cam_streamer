@@ -6,8 +6,9 @@
 struct HwSyncConfig;
 
 // Controls 4 PWM FSIN channels on the PWM1 controller via sysfs.
-// Sequential sysfs enable has ~10us offset between channels,
-// which is 0.03% of the 33.3ms period at 30Hz — negligible.
+// ch1/ch2 → IMX334 (fps),  ch3/ch4 → OV9281 (ov9281_fps).
+// Each pair can run at an independent frequency, allowing e.g.
+// IMX334@30fps + OV9281@120fps simultaneously.
 class PwmSync {
 public:
     static constexpr int NUM_CHANNELS = 4;
@@ -38,7 +39,9 @@ private:
 
     SysfsChannel sysfs_ch_[NUM_CHANNELS];
 
-    uint32_t period_ns_ = 33333333;
+    // ch0/ch1 use period_imx334_ns, ch2/ch3 use period_ov9281_ns
+    uint32_t period_imx334_ns_  = 33333333;
+    uint32_t period_ov9281_ns_  = 33333333;
     uint32_t duty_ns_ = 100000;
     bool enabled_ = false;
     bool initialized_ = false;

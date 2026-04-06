@@ -18,7 +18,7 @@ public:
     ZmqStreamer(const ZmqStreamer &) = delete;
     ZmqStreamer &operator=(const ZmqStreamer &) = delete;
 
-    bool bind(int port, int sndhwm = 2);
+    bool bind(int port, int sndhwm = 10);
     void close();
 
     bool send(const uint8_t *data, size_t size);

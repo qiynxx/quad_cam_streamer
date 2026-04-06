@@ -16,8 +16,15 @@ bool PwmSync::init(const HwSyncConfig &cfg)
 {
     if (!cfg.enabled) return false;
 
-    period_ns_ = 1000000000 / cfg.fps;
+    period_imx334_ns_ = 1000000000 / cfg.fps;
+    period_ov9281_ns_ = 1000000000 / cfg.ov9281_fps;
     duty_ns_ = 100000;  // 100us pulse width
+
+    // ch0/ch1 → IMX334, ch2/ch3 → OV9281
+    const uint32_t periods[NUM_CHANNELS] = {
+        period_imx334_ns_, period_imx334_ns_,
+        period_ov9281_ns_, period_ov9281_ns_,
+    };
 
     // Find and configure all 4 sysfs channels
     for (int i = 0; i < NUM_CHANNELS; i++) {
@@ -26,13 +33,16 @@ bool PwmSync::init(const HwSyncConfig &cfg)
                     i + 1, PWM1_CH_BASE[i]);
             return false;
         }
-        if (!configure_sysfs(sysfs_ch_[i], period_ns_, duty_ns_))
+        if (!configure_sysfs(sysfs_ch_[i], periods[i], duty_ns_))
             return false;
     }
 
     initialized_ = true;
-    fprintf(stderr, "[pwm_sync] Initialized %d channels: period=%uns duty=%uns\n",
-            NUM_CHANNELS, period_ns_, duty_ns_);
+    fprintf(stderr, "[pwm_sync] Initialized: IMX334 period=%uns (%dfps), "
+            "OV9281 period=%uns (%dfps), duty=%uns\n",
+            period_imx334_ns_, cfg.fps,
+            period_ov9281_ns_, cfg.ov9281_fps,
+            duty_ns_);
     return true;
 }
 

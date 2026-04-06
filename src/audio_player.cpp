@@ -151,6 +151,21 @@ void AudioPlayer::render_sound(Sound s)
             }
         }
         break;
+
+    case Sound::IMU_DISCONNECT:
+        // Two-tone urgent alarm: 800 Hz → 400 Hz, repeated twice
+        {
+            auto hi  = make_tone(800.0f, 0.10f, 0.8f);
+            auto lo  = make_tone(400.0f, 0.15f, 0.8f);
+            auto sil = make_silence(0.06f);
+            for (int i = 0; i < 2; i++) {
+                samples.insert(samples.end(), hi.begin(), hi.end());
+                samples.insert(samples.end(), lo.begin(), lo.end());
+                if (i < 1)
+                    samples.insert(samples.end(), sil.begin(), sil.end());
+            }
+        }
+        break;
     }
 
     write_pcm(samples);

@@ -38,6 +38,8 @@ AppConfig load_config(const std::string &path)
             if (c.contains("auto_exposure"))  cam.auto_exposure = c["auto_exposure"];
             if (c.contains("exposure_us"))    cam.exposure_us = c["exposure_us"];
             if (c.contains("analogue_gain"))  cam.analogue_gain = c["analogue_gain"];
+            if (c.contains("ae_target_brightness")) cam.ae_target_brightness = c["ae_target_brightness"];
+            if (c.contains("ae_max_analogue_gain")) cam.ae_max_analogue_gain = c["ae_max_analogue_gain"];
             if (c.contains("use_rkaiq"))      cam.use_rkaiq = c["use_rkaiq"];
             if (c.contains("sensor_entity_name")) cam.sensor_entity_name = c["sensor_entity_name"].get<std::string>();
             if (c.contains("iq_file_dir"))    cam.iq_file_dir = c["iq_file_dir"].get<std::string>();
@@ -62,6 +64,18 @@ AppConfig load_config(const std::string &path)
         }
     }
 
+    if (j.contains("serial_imus")) {
+        for (auto &si : j["serial_imus"]) {
+            SerialImuConfig sc;
+            if (si.contains("enabled"))     sc.enabled = si["enabled"];
+            if (si.contains("name"))        sc.name = si["name"].get<std::string>();
+            if (si.contains("uart_device")) sc.uart_device = si["uart_device"].get<std::string>();
+            if (si.contains("baudrate"))    sc.baudrate = si["baudrate"];
+            if (si.contains("zmq_port"))    sc.zmq_port = si["zmq_port"];
+            cfg.serial_imus.push_back(sc);
+        }
+    }
+
     if (j.contains("recording")) {
         auto &r = j["recording"];
         if (r.contains("enabled"))         cfg.recording.enabled = r["enabled"];
@@ -76,8 +90,11 @@ AppConfig load_config(const std::string &path)
 
     if (j.contains("hardware_sync")) {
         auto &hs = j["hardware_sync"];
-        if (hs.contains("enabled"))  cfg.hw_sync.enabled = hs["enabled"];
-        if (hs.contains("fps"))      cfg.hw_sync.fps = hs["fps"];
+        if (hs.contains("enabled"))     cfg.hw_sync.enabled = hs["enabled"];
+        if (hs.contains("fps"))         cfg.hw_sync.fps = hs["fps"];
+        // ov9281_fps defaults to fps if not explicitly set
+        cfg.hw_sync.ov9281_fps = cfg.hw_sync.fps;
+        if (hs.contains("ov9281_fps"))  cfg.hw_sync.ov9281_fps = hs["ov9281_fps"];
     }
 
     return cfg;

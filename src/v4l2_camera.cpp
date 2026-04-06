@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <linux/v4l2-subdev.h>
 
 #define LOG(fmt, ...) fprintf(stderr, "[V4L2] " fmt "\n", ##__VA_ARGS__)
 
@@ -160,6 +161,7 @@ bool V4L2Camera::open(const std::string &device, int width, int height, int fps)
         }
     }
 
+    refresh_control_ranges();
     return true;
 }
 
@@ -216,8 +218,117 @@ void V4L2Camera::open_subdev(const std::string &subdev_path)
     subdev_fd_ = ::open(subdev_path.c_str(), O_RDWR);
     if (subdev_fd_ < 0)
         LOG("Warning: Failed to open subdev %s: %s", subdev_path.c_str(), strerror(errno));
-    else
+    else {
         LOG("Opened subdev %s for controls", subdev_path.c_str());
+        refresh_control_ranges();
+    }
+}
+
+int V4L2Camera::exposure_min_us() const
+{
+    if (exposure_min_lines_ <= 0) return -1;
+    return (int)(exposure_min_lines_ * line_time_us_ + 0.5f);
+}
+
+int V4L2Camera::exposure_max_us() const
+{
+    if (exposure_max_lines_ <= 0) return -1;
+    return (int)(exposure_max_lines_ * line_time_us_ + 0.5f);
+}
+
+int V4L2Camera::exposure_us_to_lines(int exposure_us) const
+{
+    int exposure_lines = (int)(exposure_us / line_time_us_ + 0.5f);
+    if (exposure_lines < 1)
+        exposure_lines = 1;
+    if (exposure_min_lines_ > 0 && exposure_lines < exposure_min_lines_)
+        exposure_lines = exposure_min_lines_;
+    if (exposure_max_lines_ > 0 && exposure_lines > exposure_max_lines_)
+        exposure_lines = exposure_max_lines_;
+    return exposure_lines;
+}
+
+bool V4L2Camera::query_control_range(int ctrl_fd, uint32_t id,
+                                     int &min_value, int &max_value)
+{
+    struct v4l2_queryctrl qctrl = {};
+    qctrl.id = id;
+    if (xioctl(ctrl_fd, VIDIOC_QUERYCTRL, &qctrl) < 0)
+        return false;
+    if (qctrl.flags & V4L2_CTRL_FLAG_DISABLED)
+        return false;
+    min_value = qctrl.minimum;
+    max_value = qctrl.maximum;
+    return true;
+}
+
+void V4L2Camera::refresh_control_ranges()
+{
+    int ctrl_fd = (subdev_fd_ >= 0) ? subdev_fd_ : fd_;
+    if (ctrl_fd < 0) return;
+
+    int min_value = 0;
+    int max_value = 0;
+    if (query_control_range(ctrl_fd, V4L2_CID_EXPOSURE, min_value, max_value)) {
+        exposure_min_lines_ = min_value;
+        exposure_max_lines_ = max_value;
+        LOG("Exposure control range: %d..%d", exposure_min_lines_, exposure_max_lines_);
+    }
+
+    if (query_control_range(ctrl_fd, V4L2_CID_ANALOGUE_GAIN, min_value, max_value)) {
+        gain_min_ = min_value;
+        gain_max_ = max_value;
+        LOG("Analogue gain range: %d..%d", gain_min_, gain_max_);
+    }
+}
+
+bool V4L2Camera::set_frame_interval(int fps)
+{
+    if (subdev_fd_ < 0) return false;
+
+    // Primary: use VIDIOC_SUBDEV_S_FRAME_INTERVAL (requires kernel s_frame_interval)
+    struct v4l2_subdev_frame_interval fi = {};
+    fi.interval.numerator = 1;
+    fi.interval.denominator = fps;
+
+    if (xioctl(subdev_fd_, VIDIOC_SUBDEV_S_FRAME_INTERVAL, &fi) == 0) {
+        int actual_fps = (fi.interval.numerator > 0)
+                         ? (int)(fi.interval.denominator / fi.interval.numerator)
+                         : fps;
+        LOG("Frame interval set via subdev: requested=%dfps actual=%dfps", fps, actual_fps);
+        return true;
+    }
+
+    // Fallback: adjust VTS via V4L2_CID_VBLANK on the subdev.
+    // OV9281 pixel clock = 80 MHz, HTS = 728.
+    // VTS = pixel_clock / (HTS * fps)  → VBLANK = VTS - height
+    LOG("VIDIOC_SUBDEV_S_FRAME_INTERVAL not supported (%s), falling back to VBLANK",
+        strerror(errno));
+
+    if (height_ <= 0) {
+        LOG("Warning: height not set, cannot compute VBLANK");
+        return false;
+    }
+
+    const uint32_t pixel_clock = 80000000;  // OV9281 80 MHz
+    const uint32_t hts = 728;
+    uint32_t vts = pixel_clock / ((uint32_t)fps * hts);
+    if (vts <= (uint32_t)height_) {
+        LOG("Warning: computed VTS=%u <= height=%d, clamping", vts, height_);
+        vts = (uint32_t)height_ + 4;
+    }
+    int32_t vblank = (int32_t)(vts - (uint32_t)height_);
+
+    struct v4l2_control ctrl = {};
+    ctrl.id = V4L2_CID_VBLANK;
+    ctrl.value = vblank;
+    if (xioctl(subdev_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+        LOG("Warning: Failed to set VBLANK=%d for %dfps: %s", vblank, fps, strerror(errno));
+        return false;
+    }
+
+    LOG("Frame interval set via VBLANK: %dfps → VTS=%u VBLANK=%d", fps, vts, vblank);
+    return true;
 }
 
 void V4L2Camera::set_exposure(bool auto_exp, int exposure_us, int gain)
@@ -228,19 +339,33 @@ void V4L2Camera::set_exposure(bool auto_exp, int exposure_us, int gain)
     struct v4l2_control ctrl = {};
 
     if (!auto_exp) {
-        int exposure_lines = (int)(exposure_us / line_time_us_ + 0.5f);
-        if (exposure_lines < 1) exposure_lines = 1;
+        int exposure_lines = exposure_us_to_lines(exposure_us);
 
         ctrl.id = V4L2_CID_EXPOSURE;
         ctrl.value = exposure_lines;
-        if (xioctl(ctrl_fd, VIDIOC_S_CTRL, &ctrl) < 0)
+        if (xioctl(ctrl_fd, VIDIOC_S_CTRL, &ctrl) < 0) {
             LOG("Warning: Failed to set exposure: %s", strerror(errno));
+        } else if (xioctl(ctrl_fd, VIDIOC_G_CTRL, &ctrl) == 0 &&
+                   ctrl.value != exposure_lines) {
+            LOG("Exposure adjusted by driver: requested=%d applied=%d",
+                exposure_lines, ctrl.value);
+        }
     }
+
+    if (gain_min_ > 0 && gain < gain_min_)
+        gain = gain_min_;
+    if (gain_max_ > 0 && gain > gain_max_)
+        gain = gain_max_;
 
     ctrl.id = V4L2_CID_ANALOGUE_GAIN;
     ctrl.value = gain;
-    if (xioctl(ctrl_fd, VIDIOC_S_CTRL, &ctrl) < 0)
+    if (xioctl(ctrl_fd, VIDIOC_S_CTRL, &ctrl) < 0) {
         LOG("Warning: Failed to set gain: %s", strerror(errno));
+    } else if (xioctl(ctrl_fd, VIDIOC_G_CTRL, &ctrl) == 0 &&
+               ctrl.value != gain) {
+        LOG("Gain adjusted by driver: requested=%d applied=%d",
+            gain, ctrl.value);
+    }
 }
 
 float V4L2Camera::get_brightness(const uint8_t *nv12_data)

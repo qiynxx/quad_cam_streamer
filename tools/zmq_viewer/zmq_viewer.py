@@ -679,25 +679,29 @@ def main():
         while True:
             events = dict(poller.poll(timeout=100))
 
-            # Drain all available messages into per-camera buffers
+            # Drain all available messages, but only decode the latest frame per
+            # camera this iteration. Decoding every queued JPEG cannot keep up
+            # once the aggregate stream rate gets high enough.
             for idx, sock in sockets.items():
                 if sock not in events:
                     continue
+                latest_data = None
                 while True:
                     try:
                         data = sock.recv(zmq.NOBLOCK)
                     except zmq.Again:
                         break
-                    if len(data) <= 8:
-                        continue
-                    ts_ns = struct.unpack("<Q", data[:8])[0]
-                    jpeg_data = data[8:]
-                    arr = np.frombuffer(jpeg_data, dtype=np.uint8)
-                    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    if frame is not None:
-                        if not paused:
-                            frame_bufs[idx].append((ts_ns, frame))
-                        frame_counts[idx] += 1
+                    latest_data = data
+                if latest_data is None or len(latest_data) <= 8:
+                    continue
+                ts_ns = struct.unpack("<Q", latest_data[:8])[0]
+                jpeg_data = latest_data[8:]
+                arr = np.frombuffer(jpeg_data, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    if not paused:
+                        frame_bufs[idx].append((ts_ns, frame))
+                    frame_counts[idx] += 1
 
             # Run timestamp matching (only when not paused)
             if not paused:

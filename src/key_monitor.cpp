@@ -72,6 +72,8 @@ void KeyMonitor::run(const std::atomic<bool> &running)
     pfd.fd = fd;
     pfd.events = POLLIN;
 
+    auto last_toggle = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+
     while (running.load()) {
         int ret = poll(&pfd, 1, 500);  // 500ms timeout
         if (ret <= 0) continue;
@@ -81,8 +83,17 @@ void KeyMonitor::run(const std::atomic<bool> &running)
         if (n != sizeof(ev)) continue;
 
         if (ev.type == EV_KEY && ev.code == key_code_ && ev.value == 1) {
+            auto now = std::chrono::steady_clock::now();
+            auto since_last = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - last_toggle).count();
+            if (since_last < 500) {
+                fprintf(stderr, "[keymon] Key %d debounced (%ldms since last toggle)\n",
+                        key_code_, since_last);
+                continue;
+            }
             fprintf(stderr, "[keymon] Key %d pressed, toggling recording\n", key_code_);
             if (callback_) callback_();
+            last_toggle = std::chrono::steady_clock::now();
         }
     }
 

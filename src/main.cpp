@@ -6,6 +6,7 @@
 #include <thread>
 #include <vector>
 #include <chrono>
+#include <algorithm>
 #include <mutex>
 #include <condition_variable>
 #include <fcntl.h>
@@ -20,6 +21,7 @@
 #include "mpp_encoder.h"
 #include "zmq_streamer.h"
 #include "imu_reader.h"
+#include "serial_imu_reader.h"
 #include "euroc_recorder.h"
 #include "key_monitor.h"
 #include "pwm_sync.h"
@@ -43,9 +45,54 @@ static void signal_handler(int)
 }
 
 // ---- NV12 image transforms (applied before JPEG encoding) ----
+// Uses ARM NEON to reverse 16 bytes at a time for ~8x speedup over scalar C.
+
+#ifdef __aarch64__
+#include <arm_neon.h>
+
+// Reverse 'n' bytes from src into dst using NEON (n must be >= 0, handles tail)
+static inline void neon_reverse_row(const uint8_t *src, uint8_t *dst, int n)
+{
+    const uint8_t *end = src + n;
+    int i = 0;
+    // Process 16 bytes at a time from the end
+    for (; i + 16 <= n; i += 16) {
+        uint8x16_t v = vld1q_u8(end - i - 16);
+        v = vrev64q_u8(v);
+        v = vcombine_u8(vget_high_u8(v), vget_low_u8(v));
+        vst1q_u8(dst + i, v);
+    }
+    // Scalar tail
+    for (; i < n; i++)
+        dst[i] = src[n - 1 - i];
+}
+
+// Reverse UV pairs: swap (U0,V0)(U1,V1)... → ...(U1,V1)(U0,V0)
+// Width bytes total, processed as width/2 UV pairs
+static inline void neon_reverse_uv_row(const uint8_t *src, uint8_t *dst, int width)
+{
+    const uint8_t *end = src + width;
+    int i = 0;
+    // 16 bytes = 8 UV pairs at a time
+    for (; i + 16 <= width; i += 16) {
+        uint8x16_t v = vld1q_u8(end - i - 16);
+        // Reverse bytes within each 16-bit element (swap U,V within pair)
+        v = vrev16q_u8(v);
+        // Reverse the 16-bit UV pairs within 64-bit lanes, then swap lanes
+        uint16x8_t v16 = vrev64q_u16(vreinterpretq_u16_u8(v));
+        v = vreinterpretq_u8_u16(v16);
+        v = vcombine_u8(vget_high_u8(v), vget_low_u8(v));
+        vst1q_u8(dst + i, v);
+    }
+    // Scalar tail
+    for (; i < width; i += 2) {
+        dst[i]     = src[width - 2 - i];
+        dst[i + 1] = src[width - 1 - i];
+    }
+}
+#endif // __aarch64__
 
 // Rotate NV12 180 degrees: src -> dst (must not overlap)
-// Handles stride (bytesperline may be > width)
 static void nv12_rotate_180(const uint8_t *src, uint8_t *dst,
                             int width, int height, int stride)
 {
@@ -59,9 +106,12 @@ static void nv12_rotate_180(const uint8_t *src, uint8_t *dst,
     for (int y = 0; y < height; y++) {
         const uint8_t *sr = src_y + (height - 1 - y) * stride;
         uint8_t *dr = dst_y + y * stride;
+#ifdef __aarch64__
+        neon_reverse_row(sr, dr, width);
+#else
         for (int x = 0; x < width; x++)
             dr[x] = sr[width - 1 - x];
-        // Clear padding area if stride > width
+#endif
         if (stride > width)
             memset(dr + width, 0, stride - width);
     }
@@ -70,11 +120,14 @@ static void nv12_rotate_180(const uint8_t *src, uint8_t *dst,
     for (int y = 0; y < uv_height; y++) {
         const uint8_t *sr = src_uv + (uv_height - 1 - y) * stride;
         uint8_t *dr = dst_uv + y * stride;
+#ifdef __aarch64__
+        neon_reverse_uv_row(sr, dr, width);
+#else
         for (int x = 0; x < width; x += 2) {
             dr[x]     = sr[width - 2 - x];
             dr[x + 1] = sr[width - 1 - x];
         }
-        // Clear padding area if stride > width
+#endif
         if (stride > width)
             memset(dr + width, 128, stride - width);
     }
@@ -94,9 +147,12 @@ static void nv12_mirror(const uint8_t *src, uint8_t *dst,
     for (int y = 0; y < height; y++) {
         const uint8_t *sr = src_y + y * stride;
         uint8_t *dr = dst_y + y * stride;
+#ifdef __aarch64__
+        neon_reverse_row(sr, dr, width);
+#else
         for (int x = 0; x < width; x++)
             dr[x] = sr[width - 1 - x];
-        // Clear padding area if stride > width
+#endif
         if (stride > width)
             memset(dr + width, 0, stride - width);
     }
@@ -105,11 +161,14 @@ static void nv12_mirror(const uint8_t *src, uint8_t *dst,
     for (int y = 0; y < uv_height; y++) {
         const uint8_t *sr = src_uv + y * stride;
         uint8_t *dr = dst_uv + y * stride;
+#ifdef __aarch64__
+        neon_reverse_uv_row(sr, dr, width);
+#else
         for (int x = 0; x < width; x += 2) {
             dr[x]     = sr[width - 2 - x];
             dr[x + 1] = sr[width - 1 - x];
         }
-        // Clear padding area if stride > width
+#endif
         if (stride > width)
             memset(dr + width, 128, stride - width);
     }
@@ -138,7 +197,9 @@ static void camera_thread(int index, const CameraConfig &cam_cfg,
 
     if (cam_cfg.sensor_entity_name.find("ov9281") != std::string::npos ||
         cam_cfg.sensor_entity_name.find("ov9282") != std::string::npos) {
-        camera.set_line_time_us(9.1f);   // OV9281/9282: HTS=728, VTS=3656 @30fps
+        camera.set_line_time_us(9.1f);   // OV9281: HTS=728 @80MHz pixel clock
+        // Select 30fps or 120fps sensor mode via subdev frame interval
+        camera.set_frame_interval(cam_cfg.fps);
     } else {
         camera.set_line_time_us(14.8f);  // IMX334: HMAX=1100, INCK=74.25MHz
     }
@@ -170,6 +231,12 @@ static void camera_thread(int index, const CameraConfig &cam_cfg,
         }
     }
 
+    // Initialize runtime params from config BEFORE encoder init
+    runtime_params.auto_exposure = cam_cfg.auto_exposure;
+    runtime_params.exposure_us = cam_cfg.exposure_us;
+    runtime_params.analogue_gain = cam_cfg.analogue_gain;
+    runtime_params.jpeg_quality = stream_cfg.jpeg_quality;
+
     // Initialize encoder AFTER rkaiq to use correct stride
     MppJpegEncoder encoder;
     if (!encoder.init(cam_cfg.width, cam_cfg.height, camera.stride(),
@@ -177,12 +244,6 @@ static void camera_thread(int index, const CameraConfig &cam_cfg,
         fprintf(stderr, "[cam%d] Failed to init encoder\n", index);
         return;
     }
-
-    // Initialize runtime params from config
-    runtime_params.auto_exposure = cam_cfg.auto_exposure;
-    runtime_params.exposure_us = cam_cfg.exposure_us;
-    runtime_params.analogue_gain = cam_cfg.analogue_gain;
-    runtime_params.jpeg_quality = stream_cfg.jpeg_quality;
 
     ZmqStreamer streamer;
     if (!streamer.bind(port)) {
@@ -218,15 +279,77 @@ static void camera_thread(int index, const CameraConfig &cam_cfg,
     AutoExposure *auto_exp = nullptr;
     if (cam_cfg.auto_exposure) {
         camera.set_exposure(false, cam_cfg.exposure_us, cam_cfg.analogue_gain);
-        auto_exp = new AutoExposure(128, 100, 30000);
-        fprintf(stderr, "[cam%d] Auto exposure enabled\n", index);
+        // Use the tighter of the frame-period limit and the driver's actual
+        // exposure control range to avoid pushing the sensor past its accepted
+        // coarse-integration setting.
+        int min_exp_us = camera.exposure_min_us();
+        if (min_exp_us <= 0) min_exp_us = 100;
+
+        int frame_max_exp_us = (int)(1000000.0f / cam_cfg.fps - 2 * camera.line_time_us());
+        if (frame_max_exp_us < min_exp_us)
+            frame_max_exp_us = min_exp_us;
+
+        int sensor_max_exp_us = camera.exposure_max_us();
+        int max_exp_us = frame_max_exp_us;
+        if (sensor_max_exp_us > 0)
+            max_exp_us = std::min(max_exp_us, sensor_max_exp_us);
+        if (max_exp_us < min_exp_us)
+            max_exp_us = min_exp_us;
+
+        // Keep software AE well away from the sensor's hard frame-length edge.
+        // IMX334 becomes unstable and visibly flickers when exposure is pushed
+        // deep into the last part of the frame period.
+        int ae_max_exp_us = max_exp_us;
+        if (cam_cfg.sensor_entity_name.find("imx334") != std::string::npos) {
+            ae_max_exp_us = (max_exp_us * 65) / 100;
+            if (ae_max_exp_us < min_exp_us)
+                ae_max_exp_us = min_exp_us;
+        }
+
+        int min_gain = camera.gain_min();
+        if (min_gain <= 0)
+            min_gain = cam_cfg.analogue_gain;
+        min_gain = std::max(min_gain, cam_cfg.analogue_gain);
+
+        int max_gain = cam_cfg.ae_max_analogue_gain;
+        int sensor_max_gain = camera.gain_max();
+        if (sensor_max_gain > 0)
+            max_gain = std::min(max_gain, sensor_max_gain);
+        if (cam_cfg.sensor_entity_name.find("imx334") != std::string::npos)
+            max_gain = std::min(max_gain, 48);
+        if (max_gain < min_gain)
+            max_gain = min_gain;
+
+        int min_exp_lines = camera.exposure_min_lines();
+        int max_exp_lines = camera.exposure_max_lines();
+        int ae_max_exp_lines = camera.exposure_us_to_lines(ae_max_exp_us);
+
+        auto_exp = new AutoExposure(cam_cfg.ae_target_brightness,
+                                    min_exp_us, ae_max_exp_us,
+                                    min_gain, max_gain);
+        fprintf(stderr,
+                "[cam%d] Auto exposure enabled, target=%d"
+                " min_exp=%dus(%d lines) ae_max_exp=%dus(%d lines)"
+                " ctrl_max_exp=%dus(%d lines)"
+                " min_gain=%d max_gain=%d"
+                " (frame_limit=%d sensor_limit=%d sensor_gain_limit=%d)\n",
+                index, cam_cfg.ae_target_brightness,
+                min_exp_us, min_exp_lines, ae_max_exp_us, ae_max_exp_lines,
+                max_exp_us, max_exp_lines,
+                min_gain, max_gain,
+                frame_max_exp_us, sensor_max_exp_us, sensor_max_gain);
     } else {
         camera.set_exposure(false, cam_cfg.exposure_us, cam_cfg.analogue_gain);
-        fprintf(stderr, "[cam%d] Manual exposure: %dus gain=%d\n",
-                index, cam_cfg.exposure_us, cam_cfg.analogue_gain);
+        fprintf(stderr, "[cam%d] Manual exposure: %dus (%d lines) gain=%d\n",
+                index, cam_cfg.exposure_us,
+                camera.exposure_us_to_lines(cam_cfg.exposure_us),
+                cam_cfg.analogue_gain);
     }
 
     bool need_transform = cam_cfg.rotate_180 || cam_cfg.mirror;
+    int ae_adjust_interval = 3;
+    if (cam_cfg.sensor_entity_name.find("imx334") != std::string::npos)
+        ae_adjust_interval = 6;
 
     fprintf(stderr, "[cam%d] %s running: %dx%d@%dfps q=%d rot180=%d mirror=%d\n",
             index, name, cam_cfg.width, cam_cfg.height,
@@ -292,19 +415,22 @@ static void camera_thread(int index, const CameraConfig &cam_cfg,
             }
         }
 
-        // Auto exposure: adjust every 3 frames
-        if (auto_exp && ++ae_frame_count >= 3) {
+        // Auto exposure: IMX334 uses a slower update cadence to avoid flicker.
+        if (auto_exp && ++ae_frame_count >= ae_adjust_interval) {
             ae_frame_count = 0;
             float brightness = camera.get_brightness(frame_data);
-            int exp = runtime_params.exposure_us.load();
-            int gain = runtime_params.analogue_gain.load();
+            int old_exp = runtime_params.exposure_us.load();
+            int old_gain = runtime_params.analogue_gain.load();
+            int exp = old_exp;
+            int gain = old_gain;
             auto_exp->adjust_exposure(brightness, exp, gain);
-            if (exp != runtime_params.exposure_us.load()) {
+            if (exp != old_exp || gain != old_gain) {
                 runtime_params.exposure_us = exp;
                 runtime_params.analogue_gain = gain;
                 camera.set_exposure(false, exp, gain);
-                fprintf(stderr, "[cam%d] AE adjust: brightness=%.1f exp=%dus gain=%d\n",
-                        index, brightness, exp, gain);
+                fprintf(stderr,
+                        "[cam%d] AE adjust: brightness=%.1f exp=%dus (%d lines) gain=%d\n",
+                        index, brightness, exp, camera.exposure_us_to_lines(exp), gain);
             }
         }
 
@@ -329,8 +455,12 @@ static void camera_thread(int index, const CameraConfig &cam_cfg,
             float fps = frame_count / (float)elapsed.count();
             int current_exp = runtime_params.exposure_us.load();
             int current_gain = runtime_params.analogue_gain.load();
-            fprintf(stderr, "[cam%d] %s: %.1f fps | exp=%dus gain=%d | jpeg=%zu KB\n",
-                    index, name, fps, current_exp, current_gain, jpeg_buf.size() / 1024);
+            int current_exp_lines = camera.exposure_us_to_lines(current_exp);
+            // IMX334 exposure control is in raw sensor lines; the us value is
+            // an approximate conversion kept for readability and config I/O.
+            fprintf(stderr, "[cam%d] %s: %.1f fps | exp=%dus (%d lines) gain=%d | jpeg=%zu KB\n",
+                    index, name, fps, current_exp, current_exp_lines,
+                    current_gain, jpeg_buf.size() / 1024);
             frame_count = 0;
             fps_start = now;
         }
@@ -390,6 +520,123 @@ static void imu_thread(const ImuConfig &imu_cfg, EurocRecorder &recorder)
     reader.close();
 }
 
+static void serial_imu_thread(int serial_index, const SerialImuConfig &sc,
+                              EurocRecorder &recorder, AudioPlayer *audio)
+{
+    fprintf(stderr, "[serial_imu:%s] Starting on %s @ %d baud -> tcp://*:%d\n",
+            sc.name.c_str(), sc.uart_device.c_str(), sc.baudrate, sc.zmq_port);
+
+    SerialImuReader reader;
+    if (!reader.init(sc)) {
+        fprintf(stderr, "[serial_imu:%s] FAILED to open %s\n",
+                sc.name.c_str(), sc.uart_device.c_str());
+        if (audio) audio->play(AudioPlayer::Sound::IMU_DISCONNECT);
+        return;
+    }
+    fprintf(stderr, "[serial_imu:%s] Port opened, waiting for data...\n", sc.name.c_str());
+
+    ZmqStreamer streamer;
+    if (!streamer.bind(sc.zmq_port, 200)) {
+        fprintf(stderr, "[serial_imu:%s] Failed to bind ZMQ port %d\n",
+                sc.name.c_str(), sc.zmq_port);
+        reader.close();
+        return;
+    }
+
+    enum class State { WAITING, CONNECTED, DISCONNECTED };
+    State state = State::WAITING;
+    int sample_count = 0;
+    int period_count = 0;
+    ImuSample last_sample{};
+    auto fps_start = std::chrono::steady_clock::now();
+    auto last_data_time = fps_start;
+    auto last_alarm_time = fps_start;
+    constexpr int TIMEOUT_SEC = 3;
+    constexpr int ALARM_INTERVAL_SEC = 5;
+
+    while (g_running) {
+        ImuSample sample;
+        if (reader.read(sample)) {
+            streamer.send((const uint8_t *)&sample, sizeof(sample));
+            sample_count++;
+            period_count++;
+            last_sample = sample;
+            last_data_time = std::chrono::steady_clock::now();
+
+            if (state != State::CONNECTED) {
+                fprintf(stderr, "[serial_imu:%s] CONNECTED - receiving data\n",
+                        sc.name.c_str());
+                state = State::CONNECTED;
+            }
+
+            if (recorder.is_recording())
+                recorder.push_serial_imu(serial_index, sample);
+        }
+
+        auto now = std::chrono::steady_clock::now();
+
+        if (state == State::CONNECTED) {
+            auto silent = std::chrono::duration_cast<std::chrono::seconds>(
+                              now - last_data_time).count();
+            if (silent >= TIMEOUT_SEC) {
+                fprintf(stderr, "[serial_imu:%s] DISCONNECTED - no data for %ds\n",
+                        sc.name.c_str(), TIMEOUT_SEC);
+                state = State::DISCONNECTED;
+                if (audio) audio->play(AudioPlayer::Sound::IMU_DISCONNECT);
+                last_alarm_time = now;
+            }
+        }
+
+        if (state == State::DISCONNECTED) {
+            auto since_alarm = std::chrono::duration_cast<std::chrono::seconds>(
+                                   now - last_alarm_time).count();
+            if (since_alarm >= ALARM_INTERVAL_SEC) {
+                if (audio) audio->play(AudioPlayer::Sound::IMU_DISCONNECT);
+                last_alarm_time = now;
+            }
+        }
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - fps_start);
+        if (elapsed.count() >= 5) {
+            SerialImuParseStats pst{};
+            reader.get_parse_stats(pst, true);
+            float rate = period_count / (float)elapsed.count();
+            if (state == State::CONNECTED) {
+                fprintf(stderr, "[serial_imu:%s] %.1f Hz (total=%d) "
+                        "accel=[%.2f,%.2f,%.2f] gyro=[%.3f,%.3f,%.3f]\n",
+                        sc.name.c_str(), rate, sample_count,
+                        last_sample.accel[0], last_sample.accel[1], last_sample.accel[2],
+                        last_sample.gyro[0], last_sample.gyro[1], last_sample.gyro[2]);
+                if (pst.bad_type_or_len || pst.bad_checksum || pst.bad_tail) {
+                    fprintf(stderr, "[serial_imu:%s] parse_5s: ok=%llu type=%llu chk=%llu tail=%llu rx_bytes=%llu\n",
+                            sc.name.c_str(),
+                            (unsigned long long)pst.frames_ok,
+                            (unsigned long long)pst.bad_type_or_len,
+                            (unsigned long long)pst.bad_checksum,
+                            (unsigned long long)pst.bad_tail,
+                            (unsigned long long)pst.bytes_read);
+                }
+            } else {
+                const char *status = (state == State::WAITING) ? "WAITING" : "DISCONNECTED";
+                fprintf(stderr, "[serial_imu:%s] %s - no valid frames (parsed=%d) "
+                        "parse_5s: ok=%llu type=%llu chk=%llu tail=%llu rx_bytes=%llu\n",
+                        sc.name.c_str(), status, sample_count,
+                        (unsigned long long)pst.frames_ok,
+                        (unsigned long long)pst.bad_type_or_len,
+                        (unsigned long long)pst.bad_checksum,
+                        (unsigned long long)pst.bad_tail,
+                        (unsigned long long)pst.bytes_read);
+            }
+            period_count = 0;
+            fps_start = now;
+        }
+    }
+
+    fprintf(stderr, "[serial_imu:%s] Stopping (total samples=%d)\n",
+            sc.name.c_str(), sample_count);
+    reader.close();
+}
+
 int main(int argc, char *argv[])
 {
     const char *config_path = "/etc/quad_cam_streamer/config.json";
@@ -409,6 +656,7 @@ int main(int argc, char *argv[])
     // Install signal handlers
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
 
     // Count enabled cameras
     int enabled = 0;
@@ -447,9 +695,31 @@ int main(int argc, char *argv[])
     // Initialize and start PWM sync BEFORE cameras.
     // Sensors in FSIN slave mode need pulses immediately at STREAMON,
     // so PWM must already be running when camera threads start.
+    //
+    // Auto-detect OV9281 fps from camera config so PWM always matches
+    // the actual sensor frame rate — no manual ov9281_fps needed.
     PwmSync pwm_sync;
     bool pwm_ok = false;
     if (cfg.hw_sync.enabled) {
+        // Scan cameras: pick OV9281 fps from first enabled OV9281
+        for (auto &c : cfg.cameras) {
+            if (!c.enabled) continue;
+            if (c.sensor_entity_name.find("ov9281") != std::string::npos ||
+                c.sensor_entity_name.find("ov9282") != std::string::npos) {
+                cfg.hw_sync.ov9281_fps = c.fps;
+                fprintf(stderr, "[pwm_sync] OV9281 fps auto-detected from config: %d\n", c.fps);
+                break;
+            }
+        }
+        // Pick IMX334 fps from first enabled IMX334
+        for (auto &c : cfg.cameras) {
+            if (!c.enabled) continue;
+            if (c.sensor_entity_name.find("imx334") != std::string::npos) {
+                cfg.hw_sync.fps = c.fps;
+                fprintf(stderr, "[pwm_sync] IMX334 fps auto-detected from config: %d\n", c.fps);
+                break;
+            }
+        }
         pwm_ok = pwm_sync.init(cfg.hw_sync);
         if (pwm_ok) {
             pwm_sync.start();
@@ -467,17 +737,30 @@ int main(int argc, char *argv[])
         ctrl.run(g_running);
     });
 
-    // Key monitor thread
+    // Key monitor + toggle handler (decoupled so key detection never blocks)
+    std::atomic<bool> toggle_requested{false};
+
     if (cfg.recording.enabled) {
-        threads.emplace_back([&cfg, &recorder]() {
+        threads.emplace_back([&cfg, &toggle_requested]() {
             KeyMonitor km(cfg.recording.record_key_code,
                           cfg.recording.input_device,
-                          [&recorder]() {
-                              std::thread([&recorder]() {
-                                  recorder.toggle_recording();
-                              }).detach();
+                          [&toggle_requested]() {
+                              toggle_requested.store(true);
                           });
             km.run(g_running);
+        });
+
+        threads.emplace_back([&recorder, &toggle_requested]() {
+            fprintf(stderr, "[toggle] Handler thread started\n");
+            while (g_running.load()) {
+                if (toggle_requested.exchange(false)) {
+                    recorder.toggle_recording();
+                    toggle_requested.store(false);
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            }
+            fprintf(stderr, "[toggle] Handler thread stopped\n");
         });
     }
 
@@ -486,6 +769,22 @@ int main(int argc, char *argv[])
                 cfg.imu.i2c_device.c_str(), cfg.imu.i2c_addr,
                 cfg.imu.sampling_frequency, cfg.imu.zmq_port);
         threads.emplace_back(imu_thread, std::cref(cfg.imu), std::ref(recorder));
+    }
+
+    {
+        int si = 0;
+        for (size_t i = 0; i < cfg.serial_imus.size(); i++) {
+            if (!cfg.serial_imus[i].enabled) continue;
+            fprintf(stderr, "Serial IMU '%s': %s @ %d baud -> port %d\n",
+                    cfg.serial_imus[i].name.c_str(),
+                    cfg.serial_imus[i].uart_device.c_str(),
+                    cfg.serial_imus[i].baudrate,
+                    cfg.serial_imus[i].zmq_port);
+            threads.emplace_back(serial_imu_thread, si,
+                                 std::cref(cfg.serial_imus[i]),
+                                 std::ref(recorder), &audio);
+            si++;
+        }
     }
 
     for (size_t i = 0; i < cfg.cameras.size(); i++) {

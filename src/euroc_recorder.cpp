@@ -28,6 +28,14 @@ EurocRecorder::EurocRecorder(const AppConfig &cfg, AudioPlayer *audio)
     cam_csv_.resize(cfg_.cameras.size());
     video_pipes_.resize(cfg_.cameras.size(), nullptr);
 
+    for (auto &sc : cfg_.serial_imus) {
+        if (sc.enabled) {
+            auto q = std::make_unique<SerialImuQueue>();
+            q->name = sc.name;
+            serial_imu_queues_.push_back(std::move(q));
+        }
+    }
+
     // Match window = one frame period (from first enabled camera's fps)
     if (!enabled_indices_.empty()) {
         int fps = cfg_.cameras[enabled_indices_[0]].fps;
@@ -70,15 +78,30 @@ void EurocRecorder::push_imu(const ImuSample &sample)
     imu_queue_.push_back(sample);
 }
 
+void EurocRecorder::push_serial_imu(int serial_index, const ImuSample &sample)
+{
+    if (serial_index < 0 || serial_index >= (int)serial_imu_queues_.size())
+        return;
+    auto &q = *serial_imu_queues_[serial_index];
+    std::lock_guard<std::mutex> lock(q.mtx);
+    if ((int)q.queue.size() >= IMU_QUEUE_SIZE)
+        q.queue.pop_front();
+    q.queue.push_back(sample);
+}
+
 bool EurocRecorder::toggle_recording()
 {
-    std::lock_guard<std::mutex> lk(toggle_mtx_);
+    std::unique_lock<std::mutex> lk(toggle_mtx_, std::try_to_lock);
+    if (!lk.owns_lock()) {
+        fprintf(stderr, "[recorder] Toggle already in progress, ignoring key press\n");
+        return recording_.load();
+    }
     if (recording_.load()) {
-        stop_recording();
         if (audio_) {
             audio_->stop_rec_ticker();
             audio_->play(AudioPlayer::Sound::REC_STOP);
         }
+        stop_recording();
         return false;
     } else {
         bool ok = start_recording();
@@ -159,19 +182,38 @@ bool EurocRecorder::start_recording()
         return false;
     }
 
-    // Generate session directory name
-    time_t now = time(nullptr);
-    struct tm tm_buf;
-    localtime_r(&now, &tm_buf);
-    char ts_str[32];
-    strftime(ts_str, sizeof(ts_str), "%Y%m%d_%H%M%S", &tm_buf);
+    // Find next sequence number by scanning existing directories
+    int seq_num = 1;
+    DIR *dir = opendir(cfg_.recording.sd_mount_path.c_str());
+    if (dir) {
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != nullptr) {
+            if (strncmp(ent->d_name, "euroc_", 6) == 0) {
+                const char *suffix = ent->d_name + 6;
+                bool all_digits = true;
+                for (const char *p = suffix; *p; p++) {
+                    if (*p < '0' || *p > '9') { all_digits = false; break; }
+                }
+                if (all_digits && *suffix) {
+                    int num = atoi(suffix);
+                    if (num >= seq_num)
+                        seq_num = num + 1;
+                }
+            }
+        }
+        closedir(dir);
+    }
 
-    session_dir_ = cfg_.recording.sd_mount_path + "/euroc_" + ts_str + "/mav0";
+    char seq_str[16];
+    snprintf(seq_str, sizeof(seq_str), "%03d", seq_num);
+    session_dir_ = cfg_.recording.sd_mount_path + "/euroc_" + seq_str + "/mav0";
 
     // Create directory structure
     for (int idx : enabled_indices_)
         mkdir_p(session_dir_ + "/cam" + std::to_string(idx) + "/data");
     mkdir_p(session_dir_ + "/imu0");
+    for (auto &sq : serial_imu_queues_)
+        mkdir_p(session_dir_ + "/" + sq->name);
 
     // Open CSV files for cameras
     for (int idx : enabled_indices_) {
@@ -185,7 +227,7 @@ bool EurocRecorder::start_recording()
         cam_csv_[idx] << "#timestamp [ns],filename\n";
     }
 
-    // Open IMU CSV
+    // Open IMU CSV (I2C)
     if (cfg_.imu.enabled) {
         std::string imu_csv_path = session_dir_ + "/imu0/data.csv";
         imu_csv_.open(imu_csv_path);
@@ -198,6 +240,19 @@ bool EurocRecorder::start_recording()
                      "a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]\n";
     }
 
+    // Open serial IMU CSVs
+    for (auto &sq : serial_imu_queues_) {
+        std::string csv_path = session_dir_ + "/" + sq->name + "/data.csv";
+        sq->csv.open(csv_path);
+        if (!sq->csv.is_open()) {
+            fprintf(stderr, "[recorder] Failed to open %s\n", csv_path.c_str());
+            stop_recording();
+            return false;
+        }
+        sq->csv << "#timestamp [ns],w_RS_S_x [rad s^-1],w_RS_S_y [rad s^-1],w_RS_S_z [rad s^-1],"
+                   "a_RS_S_x [m s^-2],a_RS_S_y [m s^-2],a_RS_S_z [m s^-2]\n";
+    }
+
     // Copy sensor.yaml files
     for (int idx : enabled_indices_) {
         std::string src = cfg_.recording.calib_dir + "/cam" + std::to_string(idx) + "_sensor.yaml";
@@ -208,6 +263,12 @@ bool EurocRecorder::start_recording()
     if (cfg_.imu.enabled) {
         std::string src = cfg_.recording.calib_dir + "/imu_sensor.yaml";
         std::string dst = session_dir_ + "/imu0/sensor.yaml";
+        copy_sensor_yaml(src, dst);
+    }
+
+    for (auto &sq : serial_imu_queues_) {
+        std::string src = cfg_.recording.calib_dir + "/" + sq->name + "_sensor.yaml";
+        std::string dst = session_dir_ + "/" + sq->name + "/sensor.yaml";
         copy_sensor_yaml(src, dst);
     }
 
@@ -231,12 +292,12 @@ bool EurocRecorder::start_recording()
                 snprintf(cmd, sizeof(cmd),
                     "ffmpeg -probesize 5000000 -f mjpeg -r %d -i - "
                     "-vcodec libx264 -preset fast -b:v %dM -pix_fmt yuv420p "
-                    "-y '%s' 2>&1 | head -20",
+                    "-y '%s' 2>/dev/null",
                     fps, cfg_.recording.video_bitrate_mbps, video_path.c_str());
             } else {
                 snprintf(cmd, sizeof(cmd),
                     "ffmpeg -probesize 5000000 -f mjpeg -r %d -i - "
-                    "-vcodec copy -y '%s' 2>&1 | head -20",
+                    "-vcodec copy -y '%s' 2>/dev/null",
                     fps, video_path.c_str());
             }
 
@@ -284,7 +345,11 @@ void EurocRecorder::stop_recording()
     if (writer_thread_.joinable())
         writer_thread_.join();
 
-    // Stop disk writer
+    for (auto &cr : cam_rings_) {
+        std::lock_guard<std::mutex> lock(cr->mtx);
+        cr->buf.clear();
+    }
+
     disk_writer_running_ = false;
     write_queue_cv_.notify_all();
     if (disk_writer_thread_.joinable())
@@ -295,6 +360,8 @@ void EurocRecorder::stop_recording()
         if (f.is_open()) f.close();
     if (imu_csv_.is_open())
         imu_csv_.close();
+    for (auto &sq : serial_imu_queues_)
+        if (sq->csv.is_open()) sq->csv.close();
 
     // Close video pipes
     if (!video_pipes_.empty() && video_pipes_[0] != nullptr) {
@@ -323,13 +390,15 @@ void EurocRecorder::writer_thread_func()
     fprintf(stderr, "[recorder] Writer thread started (ring=%d, window=%.1fms, cams=%d)\n",
             RING_BUF_SIZE, match_window_ns_ / 1e6, (int)enabled_indices_.size());
 
-    while (writer_running_.load() || recording_.load()) {
-        // Process all available frame groups
+    while (writer_running_.load()) {
         bool did_work = false;
-        while (try_group_and_write())
+        while (writer_running_.load() && try_group_and_write())
             did_work = true;
 
+        if (!writer_running_.load()) break;
+
         drain_imu();
+        drain_serial_imus();
 
         if (!did_work) {
             std::unique_lock<std::mutex> lock(wake_mtx_);
@@ -337,9 +406,24 @@ void EurocRecorder::writer_thread_func()
         }
     }
 
-    // Final drain: keep grouping until no more complete groups
-    while (try_group_and_write()) {}
+    auto drain_start = std::chrono::steady_clock::now();
+    int drain_count = 0;
+    constexpr int DRAIN_TIMEOUT_SEC = 10;
+    while (try_group_and_write()) {
+        drain_count++;
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - drain_start);
+        if (elapsed.count() >= DRAIN_TIMEOUT_SEC) {
+            fprintf(stderr, "[recorder] Final drain timeout after %d groups (%ds), "
+                    "discarding remaining frames\n", drain_count, DRAIN_TIMEOUT_SEC);
+            break;
+        }
+    }
+    if (drain_count > 0)
+        fprintf(stderr, "[recorder] Final drain: flushed %d groups\n", drain_count);
+
     drain_imu();
+    drain_serial_imus();
 
     fprintf(stderr, "[recorder] Writer thread stopped (groups=%lu, dropped=%lu)\n",
             (unsigned long)groups_written_, (unsigned long)frames_dropped_);
@@ -360,8 +444,8 @@ bool EurocRecorder::try_group_and_write()
             cams_with_data.push_back(idx);
     }
 
-    // Need at least one camera with data
-    if (cams_with_data.empty())
+    // Need ALL enabled cameras to have data for a complete synchronized group
+    if ((int)cams_with_data.size() < (int)enabled_indices_.size())
         return false;
 
     // Collect front timestamps from cameras with data
@@ -385,19 +469,18 @@ bool EurocRecorder::try_group_and_write()
         return true;  // caller should retry immediately
     }
 
-    // Extract frames from cameras with data
-    uint64_t sum_ts = 0;
+    // Extract frames from all cameras
     std::vector<FrameEntry> group(cfg_.cameras.size());
 
     for (int idx : cams_with_data) {
         std::lock_guard<std::mutex> lock(cam_rings_[idx]->mtx);
         group[idx] = std::move(cam_rings_[idx]->buf.front());
         cam_rings_[idx]->buf.pop_front();
-        sum_ts += group[idx].timestamp_ns;
     }
 
-    uint64_t avg_ts = sum_ts / cams_with_data.size();
-    write_grouped_frames(avg_ts, group);
+    // Use sync master (first enabled camera = IMX334#0) timestamp as reference
+    uint64_t ref_ts = group[enabled_indices_[0]].timestamp_ns;
+    write_grouped_frames(ref_ts, group);
     groups_written_++;
 
     // Periodic stats log
@@ -420,9 +503,9 @@ void EurocRecorder::write_grouped_frames(uint64_t avg_ts,
 
     for (int idx : enabled_indices_) {
         auto &entry = frames[idx];
+        if (entry.jpeg.empty()) continue;
 
         if (is_video_mode) {
-            // Write JPEG frame to FFmpeg pipe
             if (video_pipes_[idx]) {
                 auto t0 = std::chrono::steady_clock::now();
                 size_t written = fwrite(entry.jpeg.data(), 1, entry.jpeg.size(), video_pipes_[idx]);
@@ -477,6 +560,31 @@ void EurocRecorder::drain_imu()
     }
     if (!batch.empty() && imu_csv_.is_open())
         imu_csv_.flush();
+}
+
+void EurocRecorder::drain_serial_imus()
+{
+    for (auto &sq : serial_imu_queues_) {
+        std::deque<ImuSample> batch;
+        {
+            std::lock_guard<std::mutex> lock(sq->mtx);
+            batch.swap(sq->queue);
+        }
+
+        for (auto &s : batch) {
+            if (sq->csv.is_open()) {
+                char line[256];
+                snprintf(line, sizeof(line),
+                         "%lu,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f\n",
+                         (unsigned long)s.timestamp_ns,
+                         s.gyro[0], s.gyro[1], s.gyro[2],
+                         s.accel[0], s.accel[1], s.accel[2]);
+                sq->csv << line;
+            }
+        }
+        if (!batch.empty() && sq->csv.is_open())
+            sq->csv.flush();
+    }
 }
 
 void EurocRecorder::write_body_yaml(const std::string &base_dir)

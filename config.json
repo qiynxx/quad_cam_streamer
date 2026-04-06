@@ -2,7 +2,7 @@
   "stream": {
     "host": "192.168.100.6",
     "base_port": 5550,
-    "jpeg_quality": 95
+    "jpeg_quality": 80
   },
   "cameras": [
     {
@@ -19,6 +19,8 @@
       "auto_exposure": true,
       "exposure_us": 2000,
       "analogue_gain": 16,
+      "ae_target_brightness": 100,
+      "ae_max_analogue_gain": 96,
       "use_rkaiq": false,
       "sensor_entity_name": "m01_b_imx334 5-0036",
       "iq_file_dir": "/etc/iqfiles"
@@ -37,6 +39,8 @@
       "auto_exposure": true,
       "exposure_us": 2000,
       "analogue_gain": 16,
+      "ae_target_brightness": 100,
+      "ae_max_analogue_gain": 96,
       "use_rkaiq": false,
       "sensor_entity_name": "m00_b_imx334 4-001a",
       "iq_file_dir": "/etc/iqfiles"
@@ -48,12 +52,12 @@
       "subdev": "/dev/v4l-subdev13",
       "width": 1280,
       "height": 800,
-      "fps": 30,
+      "fps": 60,
       "format": "NV12",
       "rotate_180": false,
       "mirror": true,
       "auto_exposure": false,
-      "exposure_us": 10,
+      "exposure_us": 1,
       "analogue_gain": 16,
       "use_rkaiq": false,
       "sensor_entity_name": "m02_b_ov9281 8-0060",
@@ -66,12 +70,12 @@
       "subdev": "/dev/v4l-subdev18",
       "width": 1280,
       "height": 800,
-      "fps": 30,
+      "fps": 60,
       "format": "NV12",
       "rotate_180": true,
       "mirror": true,
       "auto_exposure": false,
-      "exposure_us": 10,
+      "exposure_us": 1,
       "analogue_gain": 16,
       "use_rkaiq": false,
       "sensor_entity_name": "m03_b_ov9281 9-0060",
@@ -92,13 +96,29 @@
       [ 1, 0,  0]
     ]
   },
+  "serial_imus": [
+    {
+      "enabled": true,
+      "name": "imu_left",
+      "uart_device": "/dev/ttyS4",
+      "baudrate": 921600,
+      "zmq_port": 5561
+    },
+    {
+      "enabled": true,
+      "name": "imu_right",
+      "uart_device": "/dev/ttyS10",
+      "baudrate": 921600,
+      "zmq_port": 5562
+    }
+  ],
   "recording": {
     "enabled": true,
     "sd_mount_path": "/mnt/sdcard/SD",
     "calib_dir": "/etc/quad_cam_streamer/calib",
     "record_key_code": 115,
     "input_device": "",
-    "output_format": "video",
+    "output_format": "image",
     "video_codec": "mjpeg",
     "video_bitrate_mbps": 10
   },

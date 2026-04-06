@@ -13,11 +13,12 @@
 class AudioPlayer {
 public:
     enum class Sound {
-        BOOT,        // startup chime
-        REC_START,   // ascending beep: recording started
-        REC_BEEP,    // short beep: recording in progress tick
-        REC_STOP,    // descending beep: recording stopped
-        REC_ERROR,   // error: failed to start recording (e.g. no SD card)
+        BOOT,            // startup chime
+        REC_START,       // ascending beep: recording started
+        REC_BEEP,        // short beep: recording in progress tick
+        REC_STOP,        // descending beep: recording stopped
+        REC_ERROR,       // error: failed to start recording (e.g. no SD card)
+        IMU_DISCONNECT,  // urgent warning: serial IMU lost / open failed
     };
 
     AudioPlayer();

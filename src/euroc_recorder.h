@@ -26,8 +26,11 @@ public:
     void push_frame(int cam_index, uint64_t timestamp_ns,
                     const uint8_t *jpeg_data, size_t jpeg_size);
 
-    // Called from IMU thread - enqueues IMU sample
+    // Called from IMU thread - enqueues IMU sample (I2C IMU -> imu0)
     void push_imu(const ImuSample &sample);
+
+    // Called from serial IMU threads - enqueues sample for a named serial IMU
+    void push_serial_imu(int serial_index, const ImuSample &sample);
 
     // Toggle recording on/off (called from key monitor)
     bool toggle_recording();
@@ -55,6 +58,7 @@ private:
     bool try_group_and_write();
     void write_grouped_frames(uint64_t avg_ts, std::vector<FrameEntry> &frames);
     void drain_imu();
+    void drain_serial_imus();
     void disk_writer_thread_func();
     bool is_sd_mounted() const;
     void write_body_yaml(const std::string &base_dir);
@@ -82,9 +86,18 @@ private:
     std::mutex wake_mtx_;
     std::condition_variable wake_cv_;
 
-    // IMU queue
+    // IMU queue (I2C)
     std::mutex imu_mtx_;
     std::deque<ImuSample> imu_queue_;
+
+    // Serial IMU queues
+    struct SerialImuQueue {
+        std::string name;
+        std::mutex mtx;
+        std::deque<ImuSample> queue;
+        std::ofstream csv;
+    };
+    std::vector<std::unique_ptr<SerialImuQueue>> serial_imu_queues_;
 
     // CSV file handles
     std::vector<std::ofstream> cam_csv_;
