@@ -18,6 +18,9 @@ public:
         REC_BEEP,        // short beep: recording in progress tick
         REC_STOP,        // descending beep: recording stopped
         REC_ERROR,       // error: failed to start recording (e.g. no SD card)
+        BLE_PAIR_ENTER,  // rapid double beep: pairing mode entered
+        BLE_PAIR_ONE,    // double beep: one hand ready
+        BLE_PAIR_BOTH,   // triple beep: both hands ready
         IMU_DISCONNECT,  // urgent warning: serial IMU lost / open failed
     };
 
@@ -33,10 +36,13 @@ public:
     // Start/stop the 1-second periodic beep during recording.
     void start_rec_ticker();
     void stop_rec_ticker();
+    void start_status_ticker(Sound s, int interval_ms);
+    void stop_status_ticker();
 
 private:
     void worker();
     void ticker();
+    void status_ticker();
     void render_sound(Sound s);
     bool write_pcm(const std::vector<int16_t> &samples);
 
@@ -56,4 +62,10 @@ private:
 
     std::atomic<bool> ticker_running_{false};
     std::thread ticker_thread_;
+
+    std::atomic<bool> status_ticker_running_{false};
+    std::thread status_ticker_thread_;
+    std::mutex status_ticker_mtx_;
+    Sound status_ticker_sound_ = Sound::REC_BEEP;
+    int status_ticker_interval_ms_ = 1000;
 };

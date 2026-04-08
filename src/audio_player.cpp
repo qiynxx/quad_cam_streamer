@@ -10,6 +10,7 @@ AudioPlayer::AudioPlayer() = default;
 AudioPlayer::~AudioPlayer()
 {
     stop_rec_ticker();
+    stop_status_ticker();
 
     running_ = false;
     cv_.notify_all();
@@ -77,6 +78,25 @@ void AudioPlayer::stop_rec_ticker()
         ticker_thread_.join();
 }
 
+void AudioPlayer::start_status_ticker(Sound s, int interval_ms)
+{
+    stop_status_ticker();
+    {
+        std::lock_guard<std::mutex> lk(status_ticker_mtx_);
+        status_ticker_sound_ = s;
+        status_ticker_interval_ms_ = interval_ms;
+    }
+    status_ticker_running_ = true;
+    status_ticker_thread_ = std::thread(&AudioPlayer::status_ticker, this);
+}
+
+void AudioPlayer::stop_status_ticker()
+{
+    status_ticker_running_ = false;
+    if (status_ticker_thread_.joinable())
+        status_ticker_thread_.join();
+}
+
 // ---- private ----
 
 void AudioPlayer::worker()
@@ -100,6 +120,22 @@ void AudioPlayer::ticker()
         play(Sound::REC_BEEP);
         // Sleep 1 second in small increments so we can exit quickly
         for (int i = 0; i < 20 && ticker_running_; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+void AudioPlayer::status_ticker()
+{
+    while (status_ticker_running_) {
+        Sound sound = Sound::REC_BEEP;
+        int interval_ms = 1000;
+        {
+            std::lock_guard<std::mutex> lk(status_ticker_mtx_);
+            sound = status_ticker_sound_;
+            interval_ms = status_ticker_interval_ms_;
+        }
+        play(sound);
+        for (int elapsed = 0; elapsed < interval_ms && status_ticker_running_; elapsed += 50)
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
@@ -144,6 +180,38 @@ void AudioPlayer::render_sound(Sound s)
         {
             auto beep = make_tone(300.0f, 0.12f, 0.7f);
             auto sil  = make_silence(0.08f);
+            for (int i = 0; i < 3; i++) {
+                samples.insert(samples.end(), beep.begin(), beep.end());
+                if (i < 2)
+                    samples.insert(samples.end(), sil.begin(), sil.end());
+            }
+        }
+        break;
+
+    case Sound::BLE_PAIR_ENTER:
+        {
+            auto beep = make_tone(1400.0f, 0.05f, 0.55f);
+            auto sil  = make_silence(0.04f);
+            samples.insert(samples.end(), beep.begin(), beep.end());
+            samples.insert(samples.end(), sil.begin(), sil.end());
+            samples.insert(samples.end(), beep.begin(), beep.end());
+        }
+        break;
+
+    case Sound::BLE_PAIR_ONE:
+        {
+            auto beep = make_tone(1100.0f, 0.07f, 0.45f);
+            auto sil  = make_silence(0.06f);
+            samples.insert(samples.end(), beep.begin(), beep.end());
+            samples.insert(samples.end(), sil.begin(), sil.end());
+            samples.insert(samples.end(), beep.begin(), beep.end());
+        }
+        break;
+
+    case Sound::BLE_PAIR_BOTH:
+        {
+            auto beep = make_tone(1250.0f, 0.06f, 0.50f);
+            auto sil  = make_silence(0.05f);
             for (int i = 0; i < 3; i++) {
                 samples.insert(samples.end(), beep.begin(), beep.end());
                 if (i < 2)

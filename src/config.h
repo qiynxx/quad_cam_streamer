@@ -44,9 +44,21 @@ struct ImuConfig {
 struct SerialImuConfig {
     bool enabled = false;
     std::string name = "imu_left";
+    std::string role = "left";
     std::string uart_device = "/dev/ttyS4";
     int baudrate = 921600;
     int zmq_port = 5561;
+};
+
+struct BleImuConfig {
+    bool enabled = false;
+    bool auto_resume = true;
+    int pair_long_press_ms = 1200;
+    int pairing_status_interval_ms = 2500;
+    int disconnect_timeout_ms = 2000;
+    int disconnect_alarm_interval_ms = 5000;
+    std::string paired_left_addr;
+    std::string paired_right_addr;
 };
 
 struct RecordingConfig {
@@ -67,12 +79,22 @@ struct HwSyncConfig {
 };
 
 struct AppConfig {
+    std::string config_path;
     StreamConfig stream;
     std::vector<CameraConfig> cameras;
     ImuConfig imu;
+    BleImuConfig ble_imus;
     std::vector<SerialImuConfig> serial_imus;
     RecordingConfig recording;
     HwSyncConfig hw_sync;
 };
 
 AppConfig load_config(const std::string &path);
+bool persist_camera_config(const std::string &path,
+                           int cam_index,
+                           const CameraConfig &cam_cfg,
+                           int jpeg_quality,
+                           std::string *error = nullptr);
+bool persist_ble_pairing_config(const std::string &path,
+                                const BleImuConfig &ble_cfg,
+                                std::string *error = nullptr);

@@ -78,10 +78,21 @@
 | 接口 | 模块 | 传感器 | ZMQ 端口 |
 |------|------|--------|---------|
 | I2C `/dev/i2c-3` | `imu_reader.h` | ICM-42688-P（或 LSM6DS3） | 5560 |
-| UART `/dev/ttyS4` | `serial_imu_reader.h` | 串口 IMU（左） | 5561 |
-| UART `/dev/ttyS10` | `serial_imu_reader.h` | 串口 IMU（右） | 5562 |
+| BLE `ESP32S3-L` | `ble_imu_manager.h` | BLE IMU（左手） | 5561 |
+| BLE `ESP32S3-R` | `ble_imu_manager.h` | BLE IMU（右手） | 5562 |
+| UART `/dev/ttyS4` | `serial_imu_reader.h` | 串口 IMU（兼容旧模式） | 5561 |
+| UART `/dev/ttyS10` | `serial_imu_reader.h` | 串口 IMU（兼容旧模式） | 5562 |
 
-串口 IMU 使用 31 字节二进制帧协议（含校验和），波特率最高支持 921600。断线时自动重连，并通过音频提示（`IMU_DISCONNECT` 声效）通知用户。
+BLE 模式下，左右手 IMU 复用原来的 `imu_left` / `imu_right` ZMQ 端口与 EuRoC 录制目录，因此下游查看器和录制格式无需修改。ESP32 的 `timestamp_rk_ms` 会被换算成 `timestamp_ns`，并统一对齐到 RK 侧 `CLOCK_MONOTONIC` 时间线。
+
+BLE 配对操作：
+- 长按按键进入配对模式，扬声器快速双响提示。
+- 配对模式下，连接到一只手后周期双响，双手都就绪后周期三响。
+- 首次双手都就绪后，再次短按按键结束配对，并把左右手 BLE 地址写回 `config.json`。
+- 之后重启会根据保存的地址自动回连，不需要每次重新配对；如果需要更换设备，长按可再次进入配对模式覆盖原地址。
+- 任意一只手数据超时后，会触发 `IMU_DISCONNECT` 报错提示音。
+
+串口 IMU 使用 31 字节二进制帧协议（含校验和），波特率最高支持 921600；当 `ble_imus.enabled: false` 时仍按旧逻辑工作。
 
 数据单位统一转换为 SI 制（加速度 m/s²，角速度 rad/s）后发布。I2C IMU 还支持配置 3×3 旋转矩阵，将传感器坐标系转换到机体坐标系。
 
@@ -103,8 +114,8 @@
 
 #### 按键与音频
 
-- **KeyMonitor**（`key_monitor.h`）：监听 Linux input 事件设备，自动识别 ADC 按键（`adc-keys`），500ms 去抖动后触发录制切换回调。
-- **AudioPlayer**（`audio_player.h`）：基于 ALSA PCM 合成音效，支持 BOOT、REC\_START/STOP、REC\_BEEP（录制中定时提示音）、REC\_ERROR、IMU\_DISCONNECT 等事件。
+- **KeyMonitor**（`key_monitor.h`）：监听 Linux input 事件设备，自动识别 ADC 按键（`adc-keys`），支持短按/长按区分。默认短按用于录制切换，BLE 模式下长按进入配对、短按确认配对完成。
+- **AudioPlayer**（`audio_player.h`）：基于 ALSA PCM 合成音效，支持 BOOT、REC\_START/STOP、REC\_BEEP、REC\_ERROR、BLE 配对状态提示和 `IMU_DISCONNECT` 告警。
 
 #### 运行时参数控制（`param_controller.h`）
 
@@ -154,6 +165,7 @@ app/quad_cam_streamer/
 │   ├── auto_exposure.h / .cpp     # 软件自动曝光控制回路
 │   ├── rkaiq_controller.h / .cpp  # Rockchip ISP 3A（可选，use_rkaiq=true 时启用）
 │   ├── imu_reader.h / .cpp        # I2C IMU 读取（ICM-42688-P）
+│   ├── ble_imu_manager.h / .cpp   # ESP32 BLE 双手 IMU 接收与时间同步
 │   ├── serial_imu_reader.h / .cpp # 串口 IMU 读取（二进制帧协议）
 │   ├── euroc_recorder.h / .cpp    # EuRoC 格式录制（图像/视频/IMU）
 │   ├── key_monitor.h / .cpp       # 硬件按键监听（ADC 按键 input 事件）
@@ -264,9 +276,19 @@ cd app/quad_cam_streamer
     "zmq_port": 5560,
     "rotation_matrix": [[0,0,-1],[0,1,0],[1,0,0]]
   },
+  "ble_imus": {
+    "enabled": true,
+    "auto_resume": true,
+    "pair_long_press_ms": 1200,
+    "pairing_status_interval_ms": 2500,
+    "disconnect_timeout_ms": 2000,
+    "disconnect_alarm_interval_ms": 5000,
+    "paired_left_addr": "",
+    "paired_right_addr": ""
+  },
   "serial_imus": [
-    {"enabled": true, "name": "imu_left",  "uart_device": "/dev/ttyS4",  "baudrate": 921600, "zmq_port": 5561},
-    {"enabled": true, "name": "imu_right", "uart_device": "/dev/ttyS10", "baudrate": 921600, "zmq_port": 5562}
+    {"enabled": true, "name": "imu_left",  "role": "left",  "uart_device": "/dev/ttyS4",  "baudrate": 921600, "zmq_port": 5561},
+    {"enabled": true, "name": "imu_right", "role": "right", "uart_device": "/dev/ttyS10", "baudrate": 921600, "zmq_port": 5562}
   ],
   "recording": {
     "enabled": true,
@@ -298,6 +320,13 @@ cd app/quad_cam_streamer
 | `cameras[].auto_exposure` | 启用软件自动曝光 |
 | `cameras[].use_rkaiq` | 启用 Rockchip ISP 3A（与 auto_exposure 二选一） |
 | `imu.rotation_matrix` | 传感器→机体坐标系 3×3 旋转矩阵 |
+| `ble_imus.enabled` | 启用 BLE 双手 IMU，替代串口读取路径 |
+| `ble_imus.auto_resume` | 若已保存左右手地址，启动后自动回连 |
+| `ble_imus.pair_long_press_ms` | 进入 BLE 配对模式所需长按时长 |
+| `ble_imus.disconnect_timeout_ms` | BLE IMU 超时判定阈值 |
+| `ble_imus.paired_left_addr` | 首次成功配对后自动写入的左手 BLE 地址 |
+| `ble_imus.paired_right_addr` | 首次成功配对后自动写入的右手 BLE 地址 |
+| `serial_imus[].role` | BLE 模式下声明该输出槽位对应左手或右手 |
 | `recording.output_format` | `"image"`（JPEG 文件）或 `"video"`（AVI 容器） |
 | `recording.video_codec` | `"mjpeg"`（直接透传）或 `"h264"`（转码，需 FFmpeg） |
 | `recording.record_key_code` | 触发录制的 Linux input 按键码（115 = KEY_VOLUMEDOWN） |
@@ -314,8 +343,8 @@ cd app/quad_cam_streamer
 | 相机 2 (OV9281 #0) | 5552 | ZMQ PUB，JPEG 帧 |
 | 相机 3 (OV9281 #1) | 5553 | ZMQ PUB，JPEG 帧 |
 | I2C IMU | 5560 | ZMQ PUB，IMU 数据 |
-| 串口 IMU（左） | 5561 | ZMQ PUB，IMU 数据 |
-| 串口 IMU（右） | 5562 | ZMQ PUB，IMU 数据 |
+| 左手 IMU（BLE 或串口） | 5561 | ZMQ PUB，IMU 数据 |
+| 右手 IMU（BLE 或串口） | 5562 | ZMQ PUB，IMU 数据 |
 | 参数控制服务 | 5570 | ZMQ REP，JSON 命令接口 |
 
 ---

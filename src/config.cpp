@@ -1,10 +1,47 @@
 #include "config.h"
 
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
+
+namespace {
+
+std::mutex g_config_file_mu;
+
+bool write_json_atomic(const std::string &path, const json &j, std::string *error)
+{
+    const std::string tmp_path = path + ".tmp";
+
+    std::ofstream ofs(tmp_path);
+    if (!ofs.is_open()) {
+        if (error) *error = "Cannot open temp config file for writing";
+        return false;
+    }
+    ofs << j.dump(2) << std::endl;
+    ofs.close();
+
+    if (rename(tmp_path.c_str(), path.c_str()) != 0) {
+        if (error) *error = "Failed to rename temp config file";
+        return false;
+    }
+    return true;
+}
+
+bool load_json_file(const std::string &path, json &j, std::string *error)
+{
+    std::ifstream ifs(path);
+    if (!ifs.is_open()) {
+        if (error) *error = "Cannot open config file: " + path;
+        return false;
+    }
+    j = json::parse(ifs);
+    return true;
+}
+
+}  // namespace
 
 AppConfig load_config(const std::string &path)
 {
@@ -14,6 +51,7 @@ AppConfig load_config(const std::string &path)
 
     json j = json::parse(f);
     AppConfig cfg;
+    cfg.config_path = path;
 
     if (j.contains("stream")) {
         auto &s = j["stream"];
@@ -69,11 +107,24 @@ AppConfig load_config(const std::string &path)
             SerialImuConfig sc;
             if (si.contains("enabled"))     sc.enabled = si["enabled"];
             if (si.contains("name"))        sc.name = si["name"].get<std::string>();
+            if (si.contains("role"))        sc.role = si["role"].get<std::string>();
             if (si.contains("uart_device")) sc.uart_device = si["uart_device"].get<std::string>();
             if (si.contains("baudrate"))    sc.baudrate = si["baudrate"];
             if (si.contains("zmq_port"))    sc.zmq_port = si["zmq_port"];
             cfg.serial_imus.push_back(sc);
         }
+    }
+
+    if (j.contains("ble_imus")) {
+        auto &b = j["ble_imus"];
+        if (b.contains("enabled"))                     cfg.ble_imus.enabled = b["enabled"];
+        if (b.contains("auto_resume"))                cfg.ble_imus.auto_resume = b["auto_resume"];
+        if (b.contains("pair_long_press_ms"))         cfg.ble_imus.pair_long_press_ms = b["pair_long_press_ms"];
+        if (b.contains("pairing_status_interval_ms")) cfg.ble_imus.pairing_status_interval_ms = b["pairing_status_interval_ms"];
+        if (b.contains("disconnect_timeout_ms"))      cfg.ble_imus.disconnect_timeout_ms = b["disconnect_timeout_ms"];
+        if (b.contains("disconnect_alarm_interval_ms")) cfg.ble_imus.disconnect_alarm_interval_ms = b["disconnect_alarm_interval_ms"];
+        if (b.contains("paired_left_addr"))           cfg.ble_imus.paired_left_addr = b["paired_left_addr"].get<std::string>();
+        if (b.contains("paired_right_addr"))          cfg.ble_imus.paired_right_addr = b["paired_right_addr"].get<std::string>();
     }
 
     if (j.contains("recording")) {
@@ -98,4 +149,52 @@ AppConfig load_config(const std::string &path)
     }
 
     return cfg;
+}
+
+bool persist_camera_config(const std::string &path,
+                           int cam_index,
+                           const CameraConfig &cam_cfg,
+                           int jpeg_quality,
+                           std::string *error)
+{
+    std::lock_guard<std::mutex> lock(g_config_file_mu);
+
+    json j;
+    if (!load_json_file(path, j, error))
+        return false;
+
+    if (!j.contains("cameras") || cam_index < 0 || cam_index >= (int)j["cameras"].size()) {
+        if (error) *error = "Invalid camera index";
+        return false;
+    }
+
+    j["cameras"][cam_index]["auto_exposure"] = cam_cfg.auto_exposure;
+    j["cameras"][cam_index]["exposure_us"] = cam_cfg.exposure_us;
+    j["cameras"][cam_index]["analogue_gain"] = cam_cfg.analogue_gain;
+    j["stream"]["jpeg_quality"] = jpeg_quality;
+
+    return write_json_atomic(path, j, error);
+}
+
+bool persist_ble_pairing_config(const std::string &path,
+                                const BleImuConfig &ble_cfg,
+                                std::string *error)
+{
+    std::lock_guard<std::mutex> lock(g_config_file_mu);
+
+    json j;
+    if (!load_json_file(path, j, error))
+        return false;
+
+    auto &b = j["ble_imus"];
+    b["enabled"] = ble_cfg.enabled;
+    b["auto_resume"] = ble_cfg.auto_resume;
+    b["pair_long_press_ms"] = ble_cfg.pair_long_press_ms;
+    b["pairing_status_interval_ms"] = ble_cfg.pairing_status_interval_ms;
+    b["disconnect_timeout_ms"] = ble_cfg.disconnect_timeout_ms;
+    b["disconnect_alarm_interval_ms"] = ble_cfg.disconnect_alarm_interval_ms;
+    b["paired_left_addr"] = ble_cfg.paired_left_addr;
+    b["paired_right_addr"] = ble_cfg.paired_right_addr;
+
+    return write_json_atomic(path, j, error);
 }

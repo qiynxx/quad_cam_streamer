@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(MPP REQUIRED rockchip_mpp)
+pkg_check_modules(GIO REQUIRED gio-2.0)
 
 # cppzmq provides cmake config
 find_package(cppzmq QUIET)
@@ -27,14 +28,20 @@ add_executable(${PROJECT_NAME} ${SOURCES})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${MPP_INCLUDE_DIRS}
+    ${GIO_INCLUDE_DIRS}
     ${CMAKE_SYSROOT}/usr/include
     ${CMAKE_SYSROOT}/usr/include/rkaiq
     ${CMAKE_SYSROOT}/usr/include/rkaiq/uAPI2
     ${CMAKE_SYSROOT}/usr/include/rkaiq/common
 )
 
+target_compile_options(${PROJECT_NAME} PRIVATE
+    ${GIO_CFLAGS_OTHER}
+)
+
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ${MPP_LIBRARIES}
+    ${GIO_LIBRARIES}
     pthread
     rkaiq
     asound

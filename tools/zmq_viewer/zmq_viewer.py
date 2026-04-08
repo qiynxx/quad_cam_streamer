@@ -13,6 +13,7 @@ Features:
 - Real-time camera parameter control (exposure, gain, JPEG quality)
 - Interactive trackbars for parameter adjustment
 - Save parameters to config.json on device
+- --hands-only: only left/right hand IMU (ZMQ 5561/5562 by default), no cameras
 
 Keyboard shortcuts:
     q: Quit
@@ -25,6 +26,7 @@ Usage:
     python3 zmq_viewer.py
     python3 zmq_viewer.py --host 192.168.1.100
     python3 zmq_viewer.py --cell-width 640
+    python3 zmq_viewer.py --hands-only
 
 Requirements:
     pip install -r requirements.txt
@@ -349,6 +351,77 @@ def draw_focus_overlay(frame, focus_map, in_focus_mask, grid_size=(8, 6), alpha=
     cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
 
 
+def run_hands_only_imu_viewer(host, left_port, right_port):
+    """仅显示左右手 IMU（与 quad_cam_streamer imu_left / imu_right ZMQ 端口一致）。"""
+    imu_left = ImuReceiver(host, left_port)
+    imu_right = ImuReceiver(host, right_port)
+    imu_left.start()
+    imu_right.start()
+
+    win_w, win_h = 920, 520
+    win = "Dual Hand IMU (q=quit)"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(win, win_w, win_h)
+
+    print(f"Hands-only: LEFT  tcp://{host}:{left_port}")
+    print(f"Hands-only: RIGHT tcp://{host}:{right_port}")
+    print("  q: quit")
+
+    def draw_side(img, x0, title, port, recv):
+        latest, rate_hz = recv.get_latest()
+        y = 85
+        lh = 24
+        cv2.putText(img, title, (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+        y += lh
+        cv2.putText(img, f"tcp://{host}:{port}", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (140, 140, 140), 1)
+        y += lh
+        cv2.putText(img, f"rate: {rate_hz:.0f} Hz", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 200), 1)
+        y += lh + 8
+        if latest is None:
+            cv2.putText(img, "waiting for data...", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 100), 1)
+            return
+        ts_ns, accel, gyro = latest
+        cv2.putText(img, f"ts {ts_ns / 1e9:.6f} s", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 100), 1)
+        y += lh + 4
+        cv2.putText(img, "accel m/s2", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
+        y += lh
+        cv2.putText(img, f"  X {accel[0]:+8.2f}", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+        y += lh
+        cv2.putText(img, f"  Y {accel[1]:+8.2f}", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+        y += lh
+        cv2.putText(img, f"  Z {accel[2]:+8.2f}", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+        y += lh + 4
+        cv2.putText(img, "gyro rad/s", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (160, 160, 160), 1)
+        y += lh
+        cv2.putText(img, f"  X {gyro[0]:+8.3f}", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+        y += lh
+        cv2.putText(img, f"  Y {gyro[1]:+8.3f}", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+        y += lh
+        cv2.putText(img, f"  Z {gyro[2]:+8.3f}", (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1)
+
+    try:
+        while True:
+            img = np.zeros((win_h, win_w, 3), dtype=np.uint8)
+            cv2.rectangle(img, (0, 0), (win_w, 48), (45, 45, 45), -1)
+            cv2.putText(img, "Dual Hand IMU", (18, 33), cv2.FONT_HERSHEY_DUPLEX, 0.95, (255, 255, 255), 2)
+            mid_x = win_w // 2
+            cv2.line(img, (mid_x, 55), (mid_x, win_h - 15), (70, 70, 70), 1)
+
+            draw_side(img, 25, "LEFT", left_port, imu_left)
+            draw_side(img, mid_x + 25, "RIGHT", right_port, imu_right)
+
+            cv2.imshow(win, img)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        imu_left.stop()
+        imu_right.stop()
+        cv2.destroyAllWindows()
+
+
 def main():
     cfg = load_config()
 
@@ -356,6 +429,8 @@ def main():
     default_base_port = cfg.get("base_port", 5550)
     default_cell_width = cfg.get("cell_width", 640)
     default_imu_port = cfg.get("imu_port", 5560)
+    default_imu_left_port = cfg.get("imu_left_port", 5561)
+    default_imu_right_port = cfg.get("imu_right_port", 5562)
     cam_configs = cfg.get("cameras", [])
 
     parser = argparse.ArgumentParser(description="ZMQ MJPEG + IMU Viewer")
@@ -375,7 +450,19 @@ def main():
                         help="Parameter control port (default: 5570)")
     parser.add_argument("--no-control", action="store_true",
                         help="Disable parameter control panel")
+    parser.add_argument("--hands-only", action="store_true",
+                        help="仅显示左右手 IMU（默认端口与板端 imu_left/imu_right 一致）")
+    parser.add_argument("--imu-left-port", type=int, default=None,
+                        help=f"左手 IMU ZMQ 端口 (默认 config 或 {default_imu_left_port})")
+    parser.add_argument("--imu-right-port", type=int, default=None,
+                        help=f"右手 IMU ZMQ 端口 (默认 config 或 {default_imu_right_port})")
     args = parser.parse_args()
+
+    if args.hands_only:
+        lp = args.imu_left_port if args.imu_left_port is not None else default_imu_left_port
+        rp = args.imu_right_port if args.imu_right_port is not None else default_imu_right_port
+        run_hands_only_imu_viewer(args.host, lp, rp)
+        return
 
     # Determine camera indices and names from config
     if args.cameras is not None:

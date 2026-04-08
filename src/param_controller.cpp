@@ -12,7 +12,8 @@ using json = nlohmann::json;
 ParamController::ParamController(AppConfig &config, RuntimeCameraParams *cam_params, int num_cams)
     : config_(config), cam_params_(cam_params), num_cams_(num_cams)
 {
-    config_path_ = "/etc/quad_cam_streamer/config.json";
+    config_path_ = config_.config_path.empty() ? "/etc/quad_cam_streamer/config.json"
+                                               : config_.config_path;
 }
 
 ParamController::~ParamController() = default;
@@ -137,30 +138,9 @@ std::string ParamController::handle_command(const std::string &json_str)
 
 void ParamController::save_to_config(int cam_index, const CameraConfig &cam_cfg)
 {
-    // Read current config
-    std::ifstream ifs(config_path_);
-    if (!ifs.is_open()) {
-        throw std::runtime_error("Cannot open config file for reading");
-    }
-    json j = json::parse(ifs);
-    ifs.close();
-
-    // Update camera entry
-    j["cameras"][cam_index]["auto_exposure"] = cam_cfg.auto_exposure;
-    j["cameras"][cam_index]["exposure_us"] = cam_cfg.exposure_us;
-    j["cameras"][cam_index]["analogue_gain"] = cam_cfg.analogue_gain;
-    j["stream"]["jpeg_quality"] = config_.stream.jpeg_quality;
-
-    // Write back atomically (write to temp, then rename)
-    std::string tmp_path = config_path_ + ".tmp";
-    std::ofstream ofs(tmp_path);
-    if (!ofs.is_open()) {
-        throw std::runtime_error("Cannot open temp config file for writing");
-    }
-    ofs << j.dump(2) << std::endl;
-    ofs.close();
-
-    if (rename(tmp_path.c_str(), config_path_.c_str()) != 0) {
-        throw std::runtime_error("Failed to rename temp config file");
+    std::string error;
+    if (!persist_camera_config(config_path_, cam_index, cam_cfg,
+                               config_.stream.jpeg_quality, &error)) {
+        throw std::runtime_error(error.empty() ? "Failed to persist camera config" : error);
     }
 }

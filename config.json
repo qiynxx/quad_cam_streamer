@@ -96,10 +96,21 @@
       [ 1, 0,  0]
     ]
   },
+  "ble_imus": {
+    "enabled": true,
+    "auto_resume": true,
+    "pair_long_press_ms": 1200,
+    "pairing_status_interval_ms": 2500,
+    "disconnect_timeout_ms": 2000,
+    "disconnect_alarm_interval_ms": 5000,
+    "paired_left_addr": "",
+    "paired_right_addr": ""
+  },
   "serial_imus": [
     {
       "enabled": true,
       "name": "imu_left",
+      "role": "left",
       "uart_device": "/dev/ttyS4",
       "baudrate": 921600,
       "zmq_port": 5561
@@ -107,6 +118,7 @@
     {
       "enabled": true,
       "name": "imu_right",
+      "role": "right",
       "uart_device": "/dev/ttyS10",
       "baudrate": 921600,
       "zmq_port": 5562

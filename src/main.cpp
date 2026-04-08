@@ -1,12 +1,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <csignal>
 #include <atomic>
 #include <thread>
 #include <vector>
 #include <chrono>
 #include <algorithm>
+#include <memory>
 #include <mutex>
 #include <condition_variable>
 #include <fcntl.h>
@@ -16,6 +18,7 @@
 #include <linux/v4l2-subdev.h>
 
 #include "audio_player.h"
+#include "ble_imu_manager.h"
 #include "config.h"
 #include "v4l2_camera.h"
 #include "mpp_encoder.h"
@@ -42,6 +45,66 @@ static bool g_all_cams_ready = false;
 static void signal_handler(int)
 {
     g_running = false;
+}
+
+static std::string lower_copy(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return (char)std::tolower(c);
+    });
+    return s;
+}
+
+static BleHandRole infer_ble_hand_role(const SerialImuConfig &cfg)
+{
+    std::string key = cfg.role.empty() ? cfg.name : cfg.role;
+    key = lower_copy(key);
+    if (key.find("left") != std::string::npos)
+        return BleHandRole::LEFT;
+    if (key.find("right") != std::string::npos)
+        return BleHandRole::RIGHT;
+    return BleHandRole::UNKNOWN;
+}
+
+static std::vector<BleImuOutputConfig> build_ble_outputs(const AppConfig &cfg)
+{
+    std::vector<BleImuOutputConfig> outputs;
+    int serial_index = 0;
+    bool have_left = false;
+    bool have_right = false;
+
+    for (const auto &sc : cfg.serial_imus) {
+        if (!sc.enabled)
+            continue;
+
+        BleHandRole hand = infer_ble_hand_role(sc);
+        if (hand == BleHandRole::UNKNOWN) {
+            fprintf(stderr, "[ble_imu] Warning: cannot infer hand role for serial output '%s'\n",
+                    sc.name.c_str());
+            serial_index++;
+            continue;
+        }
+        if ((hand == BleHandRole::LEFT && have_left) ||
+            (hand == BleHandRole::RIGHT && have_right)) {
+            fprintf(stderr, "[ble_imu] Warning: duplicate BLE output role for '%s', skipping\n",
+                    sc.name.c_str());
+            serial_index++;
+            continue;
+        }
+
+        BleImuOutputConfig out;
+        out.hand = hand;
+        out.name = sc.name;
+        out.serial_index = serial_index;
+        out.zmq_port = sc.zmq_port;
+        outputs.push_back(out);
+
+        if (hand == BleHandRole::LEFT) have_left = true;
+        if (hand == BleHandRole::RIGHT) have_right = true;
+        serial_index++;
+    }
+
+    return outputs;
 }
 
 // ---- NV12 image transforms (applied before JPEG encoding) ----
@@ -689,6 +752,24 @@ int main(int argc, char *argv[])
     // Initialize EuRoC recorder
     EurocRecorder recorder(cfg, &audio);
 
+    std::unique_ptr<BleImuManager> ble_imu;
+    if (cfg.ble_imus.enabled) {
+        auto ble_outputs = build_ble_outputs(cfg);
+        if (ble_outputs.empty()) {
+            fprintf(stderr, "Error: BLE IMU enabled but no valid left/right output mapping was found in serial_imus\n");
+            return 1;
+        }
+
+        fprintf(stderr, "[ble_imu] BLE IMU mode enabled, reusing %zu serial IMU output slots\n",
+                ble_outputs.size());
+        ble_imu = std::make_unique<BleImuManager>(cfg.ble_imus, cfg.config_path,
+                                                  ble_outputs, recorder, &audio);
+        if (!ble_imu->start()) {
+            fprintf(stderr, "Error: failed to start BLE IMU manager\n");
+            return 1;
+        }
+    }
+
     // Initialize runtime camera parameters
     std::vector<RuntimeCameraParams> runtime_params(cfg.cameras.size());
 
@@ -737,30 +818,53 @@ int main(int argc, char *argv[])
         ctrl.run(g_running);
     });
 
-    // Key monitor + toggle handler (decoupled so key detection never blocks)
-    std::atomic<bool> toggle_requested{false};
+    // Key monitor + handler (short press = record toggle / pair confirm,
+    // long press = BLE pairing entry).
+    std::atomic<bool> short_press_requested{false};
+    std::atomic<bool> long_press_requested{false};
 
-    if (cfg.recording.enabled) {
-        threads.emplace_back([&cfg, &toggle_requested]() {
-            KeyMonitor km(cfg.recording.record_key_code,
-                          cfg.recording.input_device,
-                          [&toggle_requested]() {
-                              toggle_requested.store(true);
-                          });
+    if (cfg.recording.enabled || cfg.ble_imus.enabled) {
+        threads.emplace_back([&cfg, &short_press_requested, &long_press_requested]() {
+            KeyMonitor km(
+                cfg.recording.record_key_code,
+                cfg.recording.input_device,
+                [&short_press_requested]() {
+                    short_press_requested.store(true);
+                },
+                cfg.ble_imus.enabled ? KeyMonitor::Callback([&long_press_requested]() {
+                    long_press_requested.store(true);
+                }) : KeyMonitor::Callback(),
+                cfg.ble_imus.enabled ? cfg.ble_imus.pair_long_press_ms : 1200);
             km.run(g_running);
         });
 
-        threads.emplace_back([&recorder, &toggle_requested]() {
-            fprintf(stderr, "[toggle] Handler thread started\n");
+        threads.emplace_back([&cfg, &recorder, &audio, &short_press_requested,
+                              &long_press_requested, ble = ble_imu.get()]() {
+            fprintf(stderr, "[keyctl] Handler thread started\n");
             while (g_running.load()) {
-                if (toggle_requested.exchange(false)) {
-                    recorder.toggle_recording();
-                    toggle_requested.store(false);
+                if (long_press_requested.exchange(false)) {
+                    if (!ble) {
+                        audio.play(AudioPlayer::Sound::REC_ERROR);
+                    } else if (recorder.is_recording() || ble->is_pairing_mode()) {
+                        fprintf(stderr, "[keyctl] Pairing request ignored (recording=%d pairing=%d)\n",
+                                recorder.is_recording(), ble->is_pairing_mode());
+                        audio.play(AudioPlayer::Sound::REC_ERROR);
+                    } else {
+                        ble->enter_pairing_mode();
+                    }
+                }
+
+                if (short_press_requested.exchange(false)) {
+                    if (ble && ble->is_pairing_mode()) {
+                        ble->finalize_pairing();
+                    } else if (cfg.recording.enabled) {
+                        recorder.toggle_recording();
+                    }
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             }
-            fprintf(stderr, "[toggle] Handler thread stopped\n");
+            fprintf(stderr, "[keyctl] Handler thread stopped\n");
         });
     }
 
@@ -771,7 +875,7 @@ int main(int argc, char *argv[])
         threads.emplace_back(imu_thread, std::cref(cfg.imu), std::ref(recorder));
     }
 
-    {
+    if (!cfg.ble_imus.enabled) {
         int si = 0;
         for (size_t i = 0; i < cfg.serial_imus.size(); i++) {
             if (!cfg.serial_imus[i].enabled) continue;
@@ -784,6 +888,14 @@ int main(int argc, char *argv[])
                                  std::cref(cfg.serial_imus[i]),
                                  std::ref(recorder), &audio);
             si++;
+        }
+    } else {
+        for (size_t i = 0; i < cfg.serial_imus.size(); i++) {
+            if (!cfg.serial_imus[i].enabled) continue;
+            fprintf(stderr, "BLE IMU output '%s': hand=%s -> port %d\n",
+                    cfg.serial_imus[i].name.c_str(),
+                    cfg.serial_imus[i].role.c_str(),
+                    cfg.serial_imus[i].zmq_port);
         }
     }
 
@@ -799,6 +911,8 @@ int main(int argc, char *argv[])
         t.join();
 
     // Cleanup
+    if (ble_imu)
+        ble_imu->stop();
     if (pwm_ok)
         pwm_sync.stop();
     recorder.stop();

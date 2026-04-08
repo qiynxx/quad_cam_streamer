@@ -1,6 +1,7 @@
 #include "key_monitor.h"
 
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <dirent.h>
@@ -11,8 +12,15 @@
 #include <thread>
 #include <unistd.h>
 
-KeyMonitor::KeyMonitor(int key_code, const std::string &input_device, Callback cb)
-    : key_code_(key_code), input_device_(input_device), callback_(std::move(cb))
+KeyMonitor::KeyMonitor(int key_code, const std::string &input_device,
+                       Callback short_press_cb, Callback long_press_cb,
+                       int long_press_ms, int debounce_ms)
+    : key_code_(key_code),
+      input_device_(input_device),
+      short_press_cb_(std::move(short_press_cb)),
+      long_press_cb_(std::move(long_press_cb)),
+      long_press_ms_(long_press_ms),
+      debounce_ms_(debounce_ms)
 {
 }
 
@@ -66,34 +74,66 @@ void KeyMonitor::run(const std::atomic<bool> &running)
         return;
     }
 
-    fprintf(stderr, "[keymon] Monitoring key %d on %s\n", key_code_, dev_path.c_str());
+    fprintf(stderr, "[keymon] Monitoring key %d on %s (long_press=%dms)\n",
+            key_code_, dev_path.c_str(), long_press_ms_);
 
     struct pollfd pfd;
     pfd.fd = fd;
     pfd.events = POLLIN;
 
-    auto last_toggle = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+    auto last_action = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+    bool pressed = false;
+    bool long_fired = false;
+    auto press_time = std::chrono::steady_clock::now();
 
     while (running.load()) {
-        int ret = poll(&pfd, 1, 500);  // 500ms timeout
-        if (ret <= 0) continue;
+        int ret = poll(&pfd, 1, 100);
+        auto now = std::chrono::steady_clock::now();
+        if (pressed && !long_fired) {
+            auto held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - press_time).count();
+            auto since_last = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - last_action).count();
+            if (held_ms >= long_press_ms_ && since_last >= debounce_ms_) {
+                long_fired = true;
+                last_action = now;
+                fprintf(stderr, "[keymon] Key %d long pressed (%ldms)\n",
+                        key_code_, held_ms);
+                if (long_press_cb_) long_press_cb_();
+            }
+        }
+
+        if (ret <= 0)
+            continue;
 
         struct input_event ev;
         ssize_t n = read(fd, &ev, sizeof(ev));
         if (n != sizeof(ev)) continue;
 
-        if (ev.type == EV_KEY && ev.code == key_code_ && ev.value == 1) {
-            auto now = std::chrono::steady_clock::now();
+        if (ev.type != EV_KEY || ev.code != key_code_)
+            continue;
+
+        if (ev.value == 1 && !pressed) {
+            pressed = true;
+            long_fired = false;
+            press_time = std::chrono::steady_clock::now();
+        } else if (ev.value == 0 && pressed) {
+            auto release_time = std::chrono::steady_clock::now();
+            auto held_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                release_time - press_time).count();
             auto since_last = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - last_toggle).count();
-            if (since_last < 500) {
-                fprintf(stderr, "[keymon] Key %d debounced (%ldms since last toggle)\n",
+                release_time - last_action).count();
+            if (!long_fired && since_last >= debounce_ms_) {
+                fprintf(stderr, "[keymon] Key %d short pressed (%ldms)\n",
+                        key_code_, held_ms);
+                if (short_press_cb_) short_press_cb_();
+                last_action = release_time;
+            } else if (!long_fired && since_last < debounce_ms_) {
+                fprintf(stderr, "[keymon] Key %d debounced (%ldms since last action)\n",
                         key_code_, since_last);
-                continue;
             }
-            fprintf(stderr, "[keymon] Key %d pressed, toggling recording\n", key_code_);
-            if (callback_) callback_();
-            last_toggle = std::chrono::steady_clock::now();
+            pressed = false;
+            long_fired = false;
         }
     }
 
