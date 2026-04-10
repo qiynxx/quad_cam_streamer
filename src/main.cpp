@@ -818,8 +818,7 @@ int main(int argc, char *argv[])
         ctrl.run(g_running);
     });
 
-    // Key monitor + handler (short press = record toggle / pair confirm,
-    // long press = BLE pairing entry).
+    // Key monitor + handler (short press = record toggle, long press = BLE unbind + rescan).
     std::atomic<bool> short_press_requested{false};
     std::atomic<bool> long_press_requested{false};
 
@@ -841,23 +840,21 @@ int main(int argc, char *argv[])
         threads.emplace_back([&cfg, &recorder, &audio, &short_press_requested,
                               &long_press_requested, ble = ble_imu.get()]() {
             fprintf(stderr, "[keyctl] Handler thread started\n");
+
             while (g_running.load()) {
                 if (long_press_requested.exchange(false)) {
-                    if (!ble) {
-                        audio.play(AudioPlayer::Sound::REC_ERROR);
-                    } else if (recorder.is_recording() || ble->is_pairing_mode()) {
-                        fprintf(stderr, "[keyctl] Pairing request ignored (recording=%d pairing=%d)\n",
-                                recorder.is_recording(), ble->is_pairing_mode());
-                        audio.play(AudioPlayer::Sound::REC_ERROR);
+                    if (ble) {
+                        fprintf(stderr, "[keyctl] Long press -> BLE unbind + rescan\n");
+                        ble->reset_pairing_and_rescan();
+                        // 解绑确认：使用三连响提示，与“双方已连接”的长响区分开
+                        audio.play(AudioPlayer::Sound::BLE_PAIR_BOTH);
                     } else {
-                        ble->enter_pairing_mode();
+                        audio.play(AudioPlayer::Sound::REC_ERROR);
                     }
                 }
 
                 if (short_press_requested.exchange(false)) {
-                    if (ble && ble->is_pairing_mode()) {
-                        ble->finalize_pairing();
-                    } else if (cfg.recording.enabled) {
+                    if (cfg.recording.enabled) {
                         recorder.toggle_recording();
                     }
                 } else {

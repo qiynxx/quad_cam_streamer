@@ -95,10 +95,23 @@ bool method_requires_addr_type_arg(const GError *err, const char *method_name)
 {
     if (!err || !err->message) return false;
     const std::string msg = err->message;
+
+    // 如果错误本身就是 UnknownObject，说明 Device1 对象路径已经无效，
+    // 这种情况下无论是否带 addr_type 参数，调用都会失败，没有必要再重试。
+    // 这里直接返回 false，避免在已被 BlueZ 移除的对象上再次发起
+    // Connect("auto") / Disconnect("auto")，导致类似：
+    //   GDBus.Error:org.freedesktop.DBus.Error.UnknownObject:
+    //     Method "Connect" with signature "s" on interface "org.bluez.Device1" doesn't exist
+    if (msg.find("org.freedesktop.DBus.Error.UnknownObject") != std::string::npos)
+        return false;
+
     const std::string sig = std::string("Method \"") + method_name +
                             "\" with signature \"\"";
-    return msg.find("org.freedesktop.DBus.Error.UnknownMethod") != std::string::npos &&
-           msg.find(sig) != std::string::npos &&
+    // 在不同版本的 BlueZ / GLib 下，这类错误可能表现为 UnknownMethod 或 UnknownObject，
+    // 但真正关键的是提示 "Method \"X\" with signature \"\" ... doesn't exist"。
+    // 这里主要根据消息内容匹配，但上面已排除了 UnknownObject 场景，避免
+    // BlueZ 把设备对象删除后仍错误地走到带 addr_type 参数的兼容路径。
+    return msg.find(sig) != std::string::npos &&
            msg.find("doesn't exist") != std::string::npos;
 }
 
@@ -227,6 +240,58 @@ guint subscribe_props(GDBusConnection *dbus,
         cb, user_data, notify);
 }
 
+// 尝试通过 Device1.CancelConnect 取消当前正在进行的连接尝试。
+// 某些 BlueZ 版本在自动重连或上一次 Connect 尚未收尾时，会对新的
+// Connect 调用返回 "Operation already in progress"。在这种情况下先发
+// 一次 CancelConnect 再稍候重试，可以避免长时间卡在“连接进行中”的状态。
+static void cancel_connect_attempt(GDBusConnection *dbus,
+                                   const std::string &obj_path,
+                                   const char *name_for_log)
+{
+    if (!dbus || obj_path.empty())
+        return;
+
+    GError *err = nullptr;
+    GVariant *res = g_dbus_connection_call_sync(
+        dbus, "org.bluez", obj_path.c_str(),
+        "org.bluez.Device1", "CancelConnect",
+        nullptr, nullptr,
+        G_DBUS_CALL_FLAGS_NONE, 5000, nullptr, &err);
+    if (err) {
+        WARN("[%s] CancelConnect(%s): %s",
+             name_for_log ? name_for_log : "BLE",
+             obj_path.c_str(), err->message);
+        g_error_free(err);
+    } else {
+        LOG("[%s] CancelConnect(%s) succeeded",
+            name_for_log ? name_for_log : "BLE",
+            obj_path.c_str());
+    }
+    if (res) g_variant_unref(res);
+}
+
+// 尝试通过 Adapter1.RemoveDevice 把指定 Device1 对象从 BlueZ 中移除。
+// 主要用于 Connect 长时间超时后的“强制清理”，让后续重新发现得到新的 obj_path。
+bool remove_bluez_device(GDBusConnection *dbus, const std::string &obj_path)
+{
+    if (!dbus || obj_path.empty())
+        return false;
+
+    GError *err = nullptr;
+    GVariant *res = g_dbus_connection_call_sync(
+        dbus, "org.bluez", "/org/bluez/hci0",
+        "org.bluez.Adapter1", "RemoveDevice",
+        g_variant_new("(o)", obj_path.c_str()),
+        nullptr,
+        G_DBUS_CALL_FLAGS_NONE, 5000, nullptr, &err);
+    if (err) {
+        WARN("RemoveDevice(%s): %s", obj_path.c_str(), err->message);
+        g_error_free(err);
+    }
+    if (res) g_variant_unref(res);
+    return err == nullptr;
+}
+
 }  // namespace
 
 BleImuManager::BleImuManager(const BleImuConfig &cfg,
@@ -268,23 +333,36 @@ bool BleImuManager::start()
     if (!init_dbus())
         return false;
 
+    // 尝试在每次启动时软重置一次 BLE 适配器，避免上一次进程异常退出
+    // 留下的连接状态干扰本次 Connect 流程。
+    reset_adapter();
+
     running_ = true;
+    active_mode_ = true;  // Always allow streaming once devices are ready
     watchdog_thread_ = std::thread(&BleImuManager::watchdog_loop, this);
     resync_thread_ = std::thread(&BleImuManager::resync_loop, this);
     glib_thread_ = std::thread([this]() {
         g_main_loop_run(loop_);
     });
 
-    if (cfg_.auto_resume && has_saved_pairing()) {
-        active_mode_ = true;
+    if (has_saved_pairing()) {
         LOG("Auto-resume BLE pairing: left=%s right=%s",
             cfg_.paired_left_addr.c_str(), cfg_.paired_right_addr.c_str());
-        enumerate_known_devices();
-        start_scan();
     } else if (cfg_.auto_resume &&
                (!cfg_.paired_left_addr.empty() || !cfg_.paired_right_addr.empty())) {
-        WARN("BLE pairing info incomplete, waiting for manual pairing");
+        WARN("BLE pairing info incomplete, treating as unbound");
     }
+
+    // Always enumerate existing BlueZ devices once so we can pick up devices
+    // that were already known before this process started (important in
+    // unbound mode after previous runs).
+    enumerate_known_devices();
+
+    // Always start scanning for BLE IMU devices on startup.
+    start_scan();
+
+    // Initialize connection audio state for "0 connected" case.
+    update_connection_audio();
 
     LOG("BLE IMU manager started");
     return true;
@@ -375,6 +453,44 @@ bool BleImuManager::init_dbus()
     return true;
 }
 
+bool BleImuManager::reset_adapter()
+{
+    if (!dbus_)
+        return false;
+
+    // 通过 BlueZ Properties.Set("Powered") OFF/ON 来软重启适配器，
+    // 尽量把上一轮遗留的连接状态清干净，避免下一次 Connect
+    // 撞到蓝牙内核 / BlueZ 的“半连接”状态。
+    auto power_set = [&](bool on) -> bool {
+        GError *err = nullptr;
+        GVariant *res = g_dbus_connection_call_sync(
+            dbus_, "org.bluez", "/org/bluez/hci0",
+            "org.freedesktop.DBus.Properties", "Set",
+            g_variant_new("(ssv)", "org.bluez.Adapter1", "Powered",
+                          g_variant_new_boolean(on ? TRUE : FALSE)),
+            nullptr,
+            G_DBUS_CALL_FLAGS_NONE, 8000, nullptr, &err);
+        if (err) {
+            WARN("Adapter Powered=%d failed: %s", on ? 1 : 0, err->message);
+            g_error_free(err);
+            if (res) g_variant_unref(res);
+            return false;
+        }
+        if (res) g_variant_unref(res);
+        return true;
+    };
+
+    LOG("Resetting BLE adapter (Powered off/on)...");
+    power_set(false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    bool ok = power_set(true);
+    if (ok)
+        LOG("BLE adapter reset complete");
+    else
+        WARN("BLE adapter reset may be incomplete");
+    return ok;
+}
+
 void BleImuManager::start_scan()
 {
     if (!dbus_ || scan_active_)
@@ -387,9 +503,18 @@ void BleImuManager::start_scan()
         nullptr, nullptr,
         G_DBUS_CALL_FLAGS_NONE, 10000, nullptr, &err);
     if (err) {
-        WARN("StartDiscovery: %s", err->message);
+        // 如果 BlueZ 报 InProgress，说明扫描已经在进行中，可以视为成功，
+        // 避免重复调用 StartDiscovery 导致日志刷屏。
+        std::string emsg = err->message ? err->message : "";
+        if (emsg.find("org.bluez.Error.InProgress") != std::string::npos) {
+            LOG("BLE discovery already in progress");
+            scan_active_ = true;
+        } else {
+            WARN("StartDiscovery: %s", err->message);
+        }
         g_error_free(err);
-        return;
+        if (!scan_active_)
+            return;
     }
     scan_active_ = true;
     LOG("BLE discovery started");
@@ -538,17 +663,19 @@ void BleImuManager::dispatch_device_found(const std::string &path,
                                           const std::string &name,
                                           const std::string &addr)
 {
-    if (!pairing_mode_.load() && !active_mode_.load())
+    if (!running_.load())
         return;
 
-    BleHandRole expected_role = BleHandRole::UNKNOWN;
-    if (pairing_mode_.load()) {
-        expected_role = role_from_name(name);
-        if (expected_role == BleHandRole::UNKNOWN)
-            return;
-    } else {
-        expected_role = role_from_configured_addr(addr);
-        if (expected_role == BleHandRole::UNKNOWN)
+    // Always use advertised name to infer hand role.
+    BleHandRole expected_role = role_from_name(name);
+    if (expected_role == BleHandRole::UNKNOWN)
+        return;
+
+    // If we have a full saved pairing, only accept devices whose MAC matches
+    // the stored address for the inferred hand. Otherwise treat as unbound.
+    if (has_saved_pairing()) {
+        std::string configured = configured_addr_for(expected_role);
+        if (configured.empty() || configured != addr)
             return;
     }
 
@@ -573,9 +700,7 @@ void BleImuManager::dispatch_device_found(const std::string &path,
 
     if (dev->state == DevState::WAIT_ADV || dev->state == DevState::RECONNECTING) {
         LOG("Found BLE IMU %s [%s] @ %s", name.c_str(), addr.c_str(), path.c_str());
-        launch_worker([this, dev]() {
-            connect_device(dev);
-        });
+        try_connect_next();
     }
 }
 
@@ -584,11 +709,16 @@ void BleImuManager::connect_device(const std::shared_ptr<BleDevice> &dev)
     if (!running_.load() || !dev)
         return;
 
+    // 某些控制器在扫描与连接并发时稳定性较差，这里在发起 Connect 之前
+    // 临时停止扫描，待本轮 Connect 返回后再恢复 StartDiscovery。
+    stop_scan();
+
     dev->retry_pending = false;
     if (dev->state == DevState::CONNECTING ||
         dev->state == DevState::DISCOVERING ||
         dev->state == DevState::SYNCING ||
         dev->state == DevState::STREAMING) {
+        start_scan();
         return;
     }
 
@@ -596,12 +726,55 @@ void BleImuManager::connect_device(const std::shared_ptr<BleDevice> &dev)
     GError *err = nullptr;
     LOG("[%s] Connecting...", dev->name.c_str());
     GVariant *res = call_device1_method_compat(
-        dbus_, dev->obj_path, "Connect", 30000, &err);
+        dbus_, dev->obj_path, "Connect", 2000, &err);
     if (err) {
-        WARN("[%s] Connect failed: %s", dev->name.c_str(), err->message);
+        const char *msg = err->message ? err->message : "";
+        WARN("[%s] Connect failed: %s", dev->name.c_str(), msg);
         g_error_free(err);
-        dev->state = DevState::WAIT_ADV;
-        schedule_retry(dev, 1500);
+
+        std::string emsg = msg ? msg : "";
+        // 如果 Device1 对象已经不存在，说明 BlueZ 认为这个设备已经被移除。
+        // 这种情况下不再对旧的 obj_path 重试，等待 on_interfaces_added /
+        // enumerate_known_devices 发现新的对象即可。
+        if (emsg.find("org.freedesktop.DBus.Error.UnknownObject") != std::string::npos) {
+            WARN("[%s] Device object gone, waiting for rediscovery", dev->name.c_str());
+            std::lock_guard<std::mutex> lk(devs_mu_);
+            auto it = devs_.find(dev->addr);
+            if (it != devs_.end() && it->second == dev) {
+                devs_.erase(it);
+            }
+            start_scan();
+            return;
+        }
+
+        // 根据错误类型调整重试节奏，避免在 BlueZ 仍在处理上一次连接时
+        // 过于频繁地调用 Connect。
+        if (emsg.find("Operation already in progress") != std::string::npos) {
+            // BlueZ 认为当前设备仍有 Connect 在进行中：先尝试显式取消，
+            // 避免长时间卡在“连接进行中”的状态，然后短暂等待后重试。
+            cancel_connect_attempt(dbus_, dev->obj_path, dev->name.c_str());
+            dev->state = DevState::WAIT_ADV;
+            schedule_retry(dev, 1000);  // 1s 再试
+        } else if (emsg.find("Timeout was reached") != std::string::npos) {
+            // 超时：说明这轮完全没连上，且 BlueZ 可能在内部保持一个“半连接”状态。
+            // 这里通过 Adapter1.RemoveDevice 强制清理一次该设备的内部状态，
+            // 并从本地 devs_ 表中删除，让后续通过重新发现拿到一个干净的对象。
+            WARN("[%s] Connect timeout, forcing RemoveDevice and rediscovery",
+                 dev->name.c_str());
+            remove_bluez_device(dbus_, dev->obj_path);
+            {
+                std::lock_guard<std::mutex> lk(devs_mu_);
+                auto it = devs_.find(dev->addr);
+                if (it != devs_.end() && it->second == dev) {
+                    devs_.erase(it);
+                }
+            }
+        } else {
+            // 其他错误：按原来的节奏重试。
+            dev->state = DevState::WAIT_ADV;
+            schedule_retry(dev, 1500);
+        }
+        start_scan();
         return;
     }
     if (res) g_variant_unref(res);
@@ -609,6 +782,8 @@ void BleImuManager::connect_device(const std::shared_ptr<BleDevice> &dev)
     dev->state = DevState::DISCOVERING;
     LOG("[%s] Connected", dev->name.c_str());
     discover_gatt(*dev);
+    // 当前设备的 Connect 流程结束，重新开启扫描以便发现其他设备或后续重连。
+    start_scan();
 }
 
 void BleImuManager::disconnect_device(BleDevice &dev)
@@ -785,6 +960,10 @@ void BleImuManager::run_device_init(BleDevice &dev)
     dev.state = DevState::STREAMING;
     dev.last_imu_ms = monotonic_ms();
     LOG("[%s] BLE IMU streaming", dev.name.c_str());
+
+    // 当前设备已完成初始化并进入 STREAMING 状态，可以尝试连接下一个设备
+    // （优先 RIGHT，其次 LEFT），避免同时对多台设备并发 Connect。
+    try_connect_next();
 }
 
 void BleImuManager::schedule_retry(const std::shared_ptr<BleDevice> &dev, int delay_ms)
@@ -801,13 +980,9 @@ void BleImuManager::schedule_retry(const std::shared_ptr<BleDevice> &dev, int de
             return;
         if (!pairing_mode_.load() && !active_mode_.load())
             return;
-        if (dev->state == DevState::STREAMING ||
-            dev->state == DevState::CONNECTING ||
-            dev->state == DevState::DISCOVERING ||
-            dev->state == DevState::SYNCING) {
-            return;
-        }
-        connect_device(dev);
+        // 交给统一调度逻辑，根据优先级（先 R 后 L）选择下一个要连接的设备，
+        // 并确保全局只有一条 Connect 在进行。
+        try_connect_next();
     });
 }
 
@@ -1059,7 +1234,7 @@ void BleImuManager::on_imu_notify(BleDevice &dev, GVariant *params)
     }
 
     if (became_ready)
-        update_pairing_audio();
+        update_connection_audio();
 
     if (active_mode_.load() && streamer) {
         streamer->send((const uint8_t *)&sample, sizeof(sample));
@@ -1116,9 +1291,38 @@ bool BleImuManager::enable_notify(const std::string &path)
 
 void BleImuManager::watchdog_loop()
 {
+    int64_t last_enum_ms = 0;
+
     while (running_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         const int64_t now_ms = monotonic_ms();
+
+        // 若在启动阶段 BlueZ 尚未就绪导致 StartDiscovery 失败，scan_active_
+        // 会一直是 false，从而无法发现任何 BLE 设备。这里在 watchdog 中做
+        // 兜底重试：只要扫描未开启，就周期性尝试调用 start_scan()，一旦
+        // BlueZ 准备好，StartDiscovery 成功后 scan_active_ 会被置为 true。
+        if (!scan_active_) {
+            start_scan();
+        }
+
+        // 若启动早于 BlueZ / 设备广播，初始的 GetManagedObjects 可能为空，
+        // devs_ 中长期看不到任何 ESP32 设备。实际使用中长按按键触发
+        // reset_pairing_and_rescan() + enumerate_known_devices() 能立即恢复，
+        // 说明周期性补一次 GetManagedObjects 即可修复。
+        //
+        // 这里做一个轻量级兜底：当 devs_ 为空时，每隔 5 秒调用一次
+        // enumerate_known_devices()，直到至少发现一台设备为止。
+        {
+            bool devs_empty = false;
+            {
+                std::lock_guard<std::mutex> lk(devs_mu_);
+                devs_empty = devs_.empty();
+            }
+            if (devs_empty && (now_ms - last_enum_ms >= 5000)) {
+                enumerate_known_devices();
+                last_enum_ms = now_ms;
+            }
+        }
 
         std::vector<std::shared_ptr<BleDevice>> devices;
         {
@@ -1147,6 +1351,9 @@ void BleImuManager::watchdog_loop()
         if (!active_mode_.load())
             continue;
 
+        // 当前至少有多少个输出是 ready 状态（用于区分“部分掉线”的告警场景）
+        const int ready_count = ready_hand_count();
+
         std::vector<AudioPlayer::Sound> alarms;
         {
             std::lock_guard<std::mutex> lk(outputs_mu_);
@@ -1159,9 +1366,13 @@ void BleImuManager::watchdog_loop()
                 }
             }
         }
-        for (auto sound : alarms) {
-            if (audio_)
-                audio_->play(sound);
+        // 如果所有输出都已经不 ready（完全断开），只保留连接数量的节奏提示，
+        // 不再周期性播放 IMU_DISCONNECT 告警，避免两只手都关机时喇叭“乱响”。
+        if (ready_count > 0) {
+            for (auto sound : alarms) {
+                if (audio_)
+                    audio_->play(sound);
+            }
         }
     }
 }
@@ -1205,11 +1416,12 @@ void BleImuManager::update_pairing_audio()
     if (!audio_)
         return;
 
+    if (!pairing_mode_.load())
+        return;
+
     int desired_state = -1;
-    if (pairing_mode_.load()) {
-        const int ready = ready_hand_count();
-        desired_state = (ready >= 2) ? 2 : ready;
-    }
+    const int ready = ready_hand_count();
+    desired_state = (ready >= 2) ? 2 : ready;
 
     const int previous = pairing_audio_state_.load();
     if (desired_state == previous)
@@ -1224,6 +1436,102 @@ void BleImuManager::update_pairing_audio()
     } else {
         audio_->start_status_ticker(AudioPlayer::Sound::BLE_PAIR_BOTH,
                                     cfg_.pairing_status_interval_ms);
+    }
+}
+
+void BleImuManager::update_connection_audio()
+{
+    if (!audio_)
+        return;
+
+    const int ready = ready_hand_count();
+    const int expected = expected_hand_count();
+
+    int desired_state = -1;
+    if (ready <= 0) {
+        desired_state = 0;
+    } else if (ready == 1) {
+        desired_state = 1;
+    } else {
+        desired_state = 2;
+    }
+
+    const int previous = connection_beep_state_.load();
+    if (desired_state == previous)
+        return;
+    connection_beep_state_ = desired_state;
+
+    // 0/1 连接：周期性提示；2 连接：长响一次并静音
+    if (desired_state <= 0) {
+        audio_->start_status_ticker(AudioPlayer::Sound::BLE_CONN_ZERO, 2000);
+    } else if (desired_state == 1) {
+        audio_->start_status_ticker(AudioPlayer::Sound::BLE_CONN_ONE, 2000);
+    } else {
+        audio_->stop_status_ticker();
+        audio_->play(AudioPlayer::Sound::BLE_CONN_BOTH);
+
+        // 当两只手都 ready 时，如果尚未保存配对信息，则自动持久化
+        if (ready >= expected && expected > 0 && !has_saved_pairing() && !pairing_persisted_) {
+            if (persist_current_pairing()) {
+                pairing_persisted_ = true;
+            }
+        }
+    }
+}
+
+void BleImuManager::try_connect_next()
+{
+    if (!running_.load())
+        return;
+
+    std::shared_ptr<BleDevice> candidate;
+
+    {
+        std::lock_guard<std::mutex> lk(devs_mu_);
+
+        // 如果当前已经有设备在执行 Connect / Discover / Sync，则先不再发起新的连接，
+        // 等待当前流程结束，避免 BlueZ 报 "Operation already in progress"。
+        for (auto &kv : devs_) {
+            const auto &d = kv.second;
+            if (!d) continue;
+            if (d->state == DevState::CONNECTING ||
+                d->state == DevState::DISCOVERING ||
+                d->state == DevState::SYNCING) {
+                return;
+            }
+        }
+
+        // 优先选择 RIGHT 手（ESP32S3-R）
+        for (auto &kv : devs_) {
+            const auto &d = kv.second;
+            if (!d) continue;
+            if ((d->state == DevState::WAIT_ADV ||
+                 d->state == DevState::RECONNECTING) &&
+                d->role == BleHandRole::RIGHT) {
+                candidate = d;
+                break;
+            }
+        }
+
+        // 如果没有 RIGHT，再选择 LEFT
+        if (!candidate) {
+            for (auto &kv : devs_) {
+                const auto &d = kv.second;
+                if (!d) continue;
+                if ((d->state == DevState::WAIT_ADV ||
+                     d->state == DevState::RECONNECTING) &&
+                    d->role == BleHandRole::LEFT) {
+                    candidate = d;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (candidate) {
+        launch_worker([this, candidate]() {
+            connect_device(candidate);
+        });
     }
 }
 
@@ -1250,7 +1558,7 @@ void BleImuManager::set_output_ready(BleHandRole hand, bool ready, bool play_ala
     }
 
     if (changed)
-        update_pairing_audio();
+        update_connection_audio();
     if (should_alarm && active_mode_.load() && audio_)
         audio_->play(AudioPlayer::Sound::IMU_DISCONNECT);
 }
@@ -1354,4 +1662,66 @@ bool BleImuManager::persist_current_pairing()
     LOG("Saved BLE pairing: left=%s right=%s",
         cfg_.paired_left_addr.c_str(), cfg_.paired_right_addr.c_str());
     return true;
+}
+
+void BleImuManager::reset_pairing_and_rescan()
+{
+    // Clear persisted MAC addresses
+    cfg_.paired_left_addr.clear();
+    cfg_.paired_right_addr.clear();
+    pairing_persisted_ = false;
+
+    std::string error;
+    if (!persist_ble_pairing_config(config_path_, cfg_, &error)) {
+        ERR("Failed to clear BLE pairing in %s: %s",
+            config_path_.c_str(),
+            error.empty() ? "unknown error" : error.c_str());
+    } else {
+        LOG("Cleared BLE pairing in %s", config_path_.c_str());
+    }
+
+    // Disconnect and reset all known devices
+    {
+        std::vector<std::shared_ptr<BleDevice>> devices;
+        {
+            std::lock_guard<std::mutex> lk(devs_mu_);
+            for (auto &kv : devs_)
+                devices.push_back(kv.second);
+            // 清空本地表，后续通过 enumerate_known_devices 重新发现
+            devs_.clear();
+        }
+        for (auto &dev : devices) {
+            if (!dev) continue;
+            unsubscribe_device(*dev);
+            disconnect_device(*dev);
+        }
+    }
+
+    // Reset output channels
+    {
+        std::lock_guard<std::mutex> lk(outputs_mu_);
+        for (auto &out : outputs_) {
+            out.ready = false;
+            out.alarm_active = false;
+            out.last_alarm_ms = 0;
+            out.has_ts = false;
+            out.last_ts32 = 0;
+            out.ts_wraps = 0;
+        }
+    }
+
+    if (audio_) {
+        audio_->stop_status_ticker();
+    }
+    connection_beep_state_ = -1;
+    update_connection_audio();
+
+    if (!scan_active_) {
+        start_scan();
+    }
+
+    // 重新枚举 BlueZ 已知设备，保证已经存在的 ESP32 也能被重新连接
+    enumerate_known_devices();
+
+    LOG("BLE pairing reset: cleared stored MACs and restarted scan");
 }

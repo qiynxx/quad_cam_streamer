@@ -210,14 +210,37 @@ void AudioPlayer::render_sound(Sound s)
 
     case Sound::BLE_PAIR_BOTH:
         {
-            auto beep = make_tone(1250.0f, 0.06f, 0.50f);
-            auto sil  = make_silence(0.05f);
+            // 更强调“连响”感：高音短 beep，多一些间隔，方便与长响区分。
+            auto beep = make_tone(1400.0f, 0.05f, 0.55f);
+            auto sil  = make_silence(0.12f);
             for (int i = 0; i < 3; i++) {
                 samples.insert(samples.end(), beep.begin(), beep.end());
                 if (i < 2)
                     samples.insert(samples.end(), sil.begin(), sil.end());
             }
         }
+        break;
+
+    case Sound::BLE_CONN_ZERO:
+        // 0 连接：较温和的双响，提示“还未连接任何 BLE IMU”
+        {
+            // 稍微拉长单次 beep 和两次之间的间隔，让双响更明显
+            auto beep = make_tone(900.0f, 0.10f, 0.5f);
+            auto sil  = make_silence(0.15f);
+            samples.insert(samples.end(), beep.begin(), beep.end());
+            samples.insert(samples.end(), sil.begin(), sil.end());
+            samples.insert(samples.end(), beep.begin(), beep.end());
+        }
+        break;
+
+    case Sound::BLE_CONN_ONE:
+        // 1 连接：单个短 beep，时间稍微拉长一点
+        samples = make_tone(1100.0f, 0.12f, 0.55f);
+        break;
+
+    case Sound::BLE_CONN_BOTH:
+        // 2 连接：使用与 0 连接双响相同的频率，改为单次明显更长的确认 beep。
+        samples = make_tone(900.0f, 0.8f, 0.7f);
         break;
 
     case Sound::IMU_DISCONNECT:

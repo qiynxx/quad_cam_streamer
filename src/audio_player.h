@@ -21,6 +21,9 @@ public:
         BLE_PAIR_ENTER,  // rapid double beep: pairing mode entered
         BLE_PAIR_ONE,    // double beep: one hand ready
         BLE_PAIR_BOTH,   // triple beep: both hands ready
+        BLE_CONN_ZERO,   // periodic double beep: 0 BLE IMU connected
+        BLE_CONN_ONE,    // periodic single beep: 1 BLE IMU connected
+        BLE_CONN_BOTH,   // one-shot long beep: both BLE IMUs connected
         IMU_DISCONNECT,  // urgent warning: serial IMU lost / open failed
     };
 

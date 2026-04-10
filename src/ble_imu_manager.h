@@ -61,6 +61,10 @@ public:
     void dispatch_timesync(const std::string &addr, GVariant *params);
     void dispatch_imu(const std::string &addr, GVariant *params);
 
+    // Reset stored BLE pairing (MAC addresses) and restart scan.
+    // Intended to be called from the key handler on triple-press.
+    void reset_pairing_and_rescan();
+
 private:
     struct CharHandles {
         std::string imu_path;
@@ -120,6 +124,7 @@ private:
     };
 
     bool init_dbus();
+    bool reset_adapter();
     void start_scan();
     void stop_scan();
     void enumerate_known_devices();
@@ -157,6 +162,8 @@ private:
     void resync_loop();
 
     void update_pairing_audio();
+    void update_connection_audio();
+    void try_connect_next();
     void set_output_ready(BleHandRole hand, bool ready, bool play_alarm);
     OutputChannel *find_output(BleHandRole hand);
     const OutputChannel *find_output(BleHandRole hand) const;
@@ -191,5 +198,7 @@ private:
     std::atomic<bool> active_mode_{false};
     bool scan_active_ = false;
     std::atomic<int> pairing_audio_state_{-2};
+    std::atomic<int> connection_beep_state_{-1};
+    bool pairing_persisted_ = false;
     guint scan_watch_ = 0;
 };
