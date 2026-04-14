@@ -63,7 +63,7 @@ struct BleImuConfig {
 
 struct RecordingConfig {
     bool enabled = true;
-    std::string sd_mount_path = "/mnt/sdcard/SD";
+    std::string sd_mount_path = "/mnt/sdcard";  // auto-detects mounted subdirectory
     std::string calib_dir = "/etc/quad_cam_streamer/calib";
     int record_key_code = 115;  // KEY_VOLUMEUP (SARADC ~17mV = ground)
     std::string input_device;   // auto-detect "adc-keys" if empty

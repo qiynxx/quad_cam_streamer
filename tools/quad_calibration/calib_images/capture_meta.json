@@ -1,5 +1,5 @@
 {
-  "num_frame_sets": 42,
+  "num_frame_sets": 0,
   "cameras": [
     {
       "index": 0,
@@ -24,5 +24,5 @@
     "rows": 8,
     "square_size_mm": 25.0
   },
-  "capture_date": "2026-03-20T22:28:05.879483"
+  "capture_date": "2026-04-10T15:33:25.119603"
 }

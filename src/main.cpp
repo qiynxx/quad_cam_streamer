@@ -138,14 +138,13 @@ static inline void neon_reverse_uv_row(const uint8_t *src, uint8_t *dst, int wid
     int i = 0;
     // 16 bytes = 8 UV pairs at a time
     for (; i + 16 <= width; i += 16) {
-        uint8x16_t v = vld1q_u8(end - i - 16);
-        // Reverse bytes within each 16-bit element (swap U,V within pair)
-        v = vrev16q_u8(v);
-        // Reverse the 16-bit UV pairs within 64-bit lanes, then swap lanes
-        uint16x8_t v16 = vrev64q_u16(vreinterpretq_u16_u8(v));
-        v = vreinterpretq_u8_u16(v16);
-        v = vcombine_u8(vget_high_u8(v), vget_low_u8(v));
-        vst1q_u8(dst + i, v);
+        // Reverse UV pairs while preserving byte order inside each pair.
+        // NV12 stores chroma as [U0 V0][U1 V1]...; swapping bytes inside a
+        // pair turns NV12 into NV21 and causes blue/orange color casts.
+        uint16x8_t v16 = vreinterpretq_u16_u8(vld1q_u8(end - i - 16));
+        v16 = vrev64q_u16(v16);
+        v16 = vcombine_u16(vget_high_u16(v16), vget_low_u16(v16));
+        vst1q_u8(dst + i, vreinterpretq_u8_u16(v16));
     }
     // Scalar tail
     for (; i < width; i += 2) {
@@ -820,28 +819,46 @@ int main(int argc, char *argv[])
 
     // Key monitor + handler (short press = record toggle / pair confirm,
     // long press = BLE pairing entry).
+    // Uses condition variable for instant key response instead of polling.
     std::atomic<bool> short_press_requested{false};
     std::atomic<bool> long_press_requested{false};
+    std::mutex key_cv_mtx;
+    std::condition_variable key_cv;
 
     if (cfg.recording.enabled || cfg.ble_imus.enabled) {
-        threads.emplace_back([&cfg, &short_press_requested, &long_press_requested]() {
+        threads.emplace_back([&cfg, &short_press_requested, &long_press_requested,
+                              &key_cv]() {
             KeyMonitor km(
                 cfg.recording.record_key_code,
                 cfg.recording.input_device,
-                [&short_press_requested]() {
+                [&short_press_requested, &key_cv]() {
                     short_press_requested.store(true);
+                    key_cv.notify_one();
                 },
-                cfg.ble_imus.enabled ? KeyMonitor::Callback([&long_press_requested]() {
+                cfg.ble_imus.enabled ? KeyMonitor::Callback([&long_press_requested, &key_cv]() {
                     long_press_requested.store(true);
+                    key_cv.notify_one();
                 }) : KeyMonitor::Callback(),
                 cfg.ble_imus.enabled ? cfg.ble_imus.pair_long_press_ms : 1200);
             km.run(g_running);
         });
 
         threads.emplace_back([&cfg, &recorder, &audio, &short_press_requested,
-                              &long_press_requested, ble = ble_imu.get()]() {
+                              &long_press_requested, &key_cv, &key_cv_mtx,
+                              ble = ble_imu.get()]() {
             fprintf(stderr, "[keyctl] Handler thread started\n");
             while (g_running.load()) {
+                // Wait for key event or periodic wakeup (for shutdown check)
+                {
+                    std::unique_lock<std::mutex> lk(key_cv_mtx);
+                    key_cv.wait_for(lk, std::chrono::milliseconds(200), [&]() {
+                        return short_press_requested.load() || long_press_requested.load()
+                               || !g_running.load();
+                    });
+                }
+
+                if (!g_running.load()) break;
+
                 if (long_press_requested.exchange(false)) {
                     if (!ble) {
                         audio.play(AudioPlayer::Sound::REC_ERROR);
@@ -860,8 +877,6 @@ int main(int argc, char *argv[])
                     } else if (cfg.recording.enabled) {
                         recorder.toggle_recording();
                     }
-                } else {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             }
             fprintf(stderr, "[keyctl] Handler thread stopped\n");

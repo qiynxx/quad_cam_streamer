@@ -126,7 +126,7 @@
   ],
   "recording": {
     "enabled": true,
-    "sd_mount_path": "/mnt/sdcard/SD",
+    "sd_mount_path": "/mnt/sdcard",
     "calib_dir": "/etc/quad_cam_streamer/calib",
     "record_key_code": 115,
     "input_device": "",

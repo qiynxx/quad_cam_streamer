@@ -7,6 +7,7 @@
 #include <ctime>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <fstream>
@@ -123,39 +124,66 @@ void EurocRecorder::stop()
         stop_recording();
 }
 
-bool EurocRecorder::is_sd_mounted() const
+// Find SD card mount path. The configured sd_mount_path can be either:
+//   1. An exact mount point (e.g. /mnt/sdcard/SD) — used directly if it's a mount point.
+//   2. A parent directory (e.g. /mnt/sdcard) — auto-scans for the first mounted subdirectory.
+// Returns the resolved path, or empty string if no SD card found.
+std::string EurocRecorder::find_sd_mount_path() const
 {
     const std::string &path = cfg_.recording.sd_mount_path;
     struct stat st_path, st_parent;
 
-    // Check if path exists
     if (stat(path.c_str(), &st_path) != 0) {
         fprintf(stderr, "[recorder] Path does not exist: %s\n", path.c_str());
-        return false;
+        return "";
     }
 
-    // Check if it's a directory
     if (!S_ISDIR(st_path.st_mode)) {
         fprintf(stderr, "[recorder] Path is not a directory: %s\n", path.c_str());
-        return false;
+        return "";
     }
 
-    // Get parent directory stat
-    std::string parent = path.substr(0, path.find_last_of('/'));
-    if (parent.empty()) parent = "/";
+    // Check if the configured path itself is a mount point
+    std::string parent_of_path = path.substr(0, path.find_last_of('/'));
+    if (parent_of_path.empty()) parent_of_path = "/";
 
-    if (stat(parent.c_str(), &st_parent) != 0) {
-        fprintf(stderr, "[recorder] Cannot stat parent: %s\n", parent.c_str());
-        return false;
+    if (stat(parent_of_path.c_str(), &st_parent) == 0 &&
+        st_path.st_dev != st_parent.st_dev) {
+        // Configured path IS a mount point — use it directly
+        fprintf(stderr, "[recorder] SD card found at configured path: %s\n", path.c_str());
+        return path;
     }
 
-    // Check if it's a mount point (different device from parent)
-    if (st_path.st_dev == st_parent.st_dev) {
-        fprintf(stderr, "[recorder] Path is not a mount point: %s\n", path.c_str());
-        return false;
+    // Configured path is not a mount point — scan subdirectories for a mount point
+    DIR *dir = opendir(path.c_str());
+    if (!dir) {
+        fprintf(stderr, "[recorder] Cannot open directory: %s\n", path.c_str());
+        return "";
     }
 
-    return true;
+    std::string found;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (ent->d_name[0] == '.') continue;  // skip . and ..
+
+        std::string child = path + "/" + ent->d_name;
+        struct stat st_child;
+        if (stat(child.c_str(), &st_child) != 0) continue;
+        if (!S_ISDIR(st_child.st_mode)) continue;
+
+        // Check if this subdirectory is on a different device (= mount point)
+        if (st_child.st_dev != st_path.st_dev) {
+            found = child;
+            fprintf(stderr, "[recorder] SD card auto-detected: %s\n", found.c_str());
+            break;
+        }
+    }
+    closedir(dir);
+
+    if (found.empty()) {
+        fprintf(stderr, "[recorder] No mounted SD card found under %s\n", path.c_str());
+    }
+    return found;
 }
 
 static void mkdir_p(const std::string &path)
@@ -176,15 +204,28 @@ bool EurocRecorder::start_recording()
         return false;
     }
 
-    if (!is_sd_mounted()) {
-        fprintf(stderr, "[recorder] SD card not mounted at %s\n",
+    std::string sd_path = find_sd_mount_path();
+    if (sd_path.empty()) {
+        fprintf(stderr, "[recorder] SD card not found (configured: %s)\n",
                 cfg_.recording.sd_mount_path.c_str());
         return false;
     }
 
+    // Check free disk space
+    struct statvfs vfs;
+    if (statvfs(sd_path.c_str(), &vfs) == 0) {
+        uint64_t free_mb = (uint64_t)vfs.f_bavail * vfs.f_frsize / (1024 * 1024);
+        if (free_mb < MIN_FREE_SPACE_MB) {
+            fprintf(stderr, "[recorder] Insufficient disk space: %luMB free, need %luMB\n",
+                    (unsigned long)free_mb, (unsigned long)MIN_FREE_SPACE_MB);
+            return false;
+        }
+        fprintf(stderr, "[recorder] Disk space: %luMB free\n", (unsigned long)free_mb);
+    }
+
     // Find next sequence number by scanning existing directories
     int seq_num = 1;
-    DIR *dir = opendir(cfg_.recording.sd_mount_path.c_str());
+    DIR *dir = opendir(sd_path.c_str());
     if (dir) {
         struct dirent *ent;
         while ((ent = readdir(dir)) != nullptr) {
@@ -206,7 +247,7 @@ bool EurocRecorder::start_recording()
 
     char seq_str[16];
     snprintf(seq_str, sizeof(seq_str), "%03d", seq_num);
-    session_dir_ = cfg_.recording.sd_mount_path + "/euroc_" + seq_str + "/mav0";
+    session_dir_ = sd_path + "/euroc_" + seq_str + "/mav0";
 
     // Create directory structure
     for (int idx : enabled_indices_)
@@ -318,6 +359,8 @@ bool EurocRecorder::start_recording()
     }
     groups_written_ = 0;
     frames_dropped_ = 0;
+    write_queue_drops_ = 0;
+    csv_flush_counter_ = 0;
 
     // Start writer thread
     writer_running_ = true;
@@ -338,51 +381,75 @@ bool EurocRecorder::start_recording()
 void EurocRecorder::stop_recording()
 {
     fprintf(stderr, "[recorder] Stopping recording...\n");
+
+    // 1. Stop accepting new frames from camera threads
     recording_ = false;
+
+    // 2. Let writer thread drain all remaining ring buffer frames
+    //    Do NOT clear ring buffers here — writer thread needs them for drain.
     writer_running_ = false;
     wake_cv_.notify_all();
 
     if (writer_thread_.joinable())
         writer_thread_.join();
 
-    for (auto &cr : cam_rings_) {
-        std::lock_guard<std::mutex> lock(cr->mtx);
-        cr->buf.clear();
+    // 3. Log residual frames that couldn't be drained
+    {
+        int residual = 0;
+        for (auto &cr : cam_rings_) {
+            std::lock_guard<std::mutex> lock(cr->mtx);
+            residual += (int)cr->buf.size();
+            cr->buf.clear();
+        }
+        if (residual > 0)
+            fprintf(stderr, "[recorder] WARNING: %d residual frames discarded from ring buffers\n", residual);
     }
 
+    // 4. Wait for disk writer to finish ALL queued writes (no timeout — data integrity first)
     disk_writer_running_ = false;
     write_queue_cv_.notify_all();
-    if (disk_writer_thread_.joinable())
+    if (disk_writer_thread_.joinable()) {
+        fprintf(stderr, "[recorder] Waiting for disk writer to flush %zu pending writes...\n",
+                write_queue_.size());
         disk_writer_thread_.join();
+    }
 
-    // Close CSV files
-    for (auto &f : cam_csv_)
-        if (f.is_open()) f.close();
-    if (imu_csv_.is_open())
+    // 5. Close CSV files
+    for (auto &f : cam_csv_) {
+        if (f.is_open()) { f.flush(); f.close(); }
+    }
+    if (imu_csv_.is_open()) {
+        imu_csv_.flush();
         imu_csv_.close();
-    for (auto &sq : serial_imu_queues_)
-        if (sq->csv.is_open()) sq->csv.close();
+    }
+    for (auto &sq : serial_imu_queues_) {
+        if (sq->csv.is_open()) { sq->csv.flush(); sq->csv.close(); }
+    }
 
-    // Close video pipes
-    if (!video_pipes_.empty() && video_pipes_[0] != nullptr) {
+    // 6. Close video pipes
+    bool has_video = false;
+    for (auto &pipe : video_pipes_) {
+        if (pipe) { has_video = true; break; }
+    }
+    if (has_video) {
         fprintf(stderr, "[recorder] Flushing video files to SD card, please wait...\n");
     }
     for (int idx = 0; idx < (int)video_pipes_.size(); idx++) {
         auto &pipe = video_pipes_[idx];
         if (pipe) {
-            fflush(pipe);  // Flush buffered data to FFmpeg
+            fflush(pipe);
             fprintf(stderr, "[recorder] Closing FFmpeg for cam%d...\n", idx);
-            pclose(pipe);  // Wait for FFmpeg to finish writing
+            pclose(pipe);
             pipe = nullptr;
         }
     }
-    if (!video_pipes_.empty() && video_pipes_[0] != nullptr) {
+    if (has_video) {
         fprintf(stderr, "[recorder] All video files written to SD card\n");
     }
 
-    fprintf(stderr, "[recorder] Recording stopped: %s (groups=%lu, dropped=%lu)\n",
+    fprintf(stderr, "[recorder] Recording stopped: %s (groups=%lu, dropped=%lu, queue_drops=%lu)\n",
             session_dir_.c_str(), (unsigned long)groups_written_,
-            (unsigned long)frames_dropped_);
+            (unsigned long)frames_dropped_, (unsigned long)write_queue_drops_);
 }
 
 void EurocRecorder::writer_thread_func()
@@ -406,19 +473,11 @@ void EurocRecorder::writer_thread_func()
         }
     }
 
-    auto drain_start = std::chrono::steady_clock::now();
+    // Drain all remaining complete groups from ring buffers (no timeout).
+    // Incomplete groups (missing cameras) are left for stop_recording() to report.
     int drain_count = 0;
-    constexpr int DRAIN_TIMEOUT_SEC = 10;
-    while (try_group_and_write()) {
+    while (try_group_and_write())
         drain_count++;
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now() - drain_start);
-        if (elapsed.count() >= DRAIN_TIMEOUT_SEC) {
-            fprintf(stderr, "[recorder] Final drain timeout after %d groups (%ds), "
-                    "discarding remaining frames\n", drain_count, DRAIN_TIMEOUT_SEC);
-            break;
-        }
-    }
     if (drain_count > 0)
         fprintf(stderr, "[recorder] Final drain: flushed %d groups\n", drain_count);
 
@@ -485,9 +544,14 @@ bool EurocRecorder::try_group_and_write()
 
     // Periodic stats log
     if (groups_written_ % STATS_INTERVAL == 0) {
-        fprintf(stderr, "[recorder] groups=%lu dropped=%lu spread=%.2fms\n",
+        size_t wq_size = 0;
+        {
+            std::lock_guard<std::mutex> lock(write_queue_mtx_);
+            wq_size = write_queue_.size();
+        }
+        fprintf(stderr, "[recorder] groups=%lu dropped=%lu queue_drops=%lu wq=%zu spread=%.2fms\n",
                 (unsigned long)groups_written_, (unsigned long)frames_dropped_,
-                spread / 1e6);
+                (unsigned long)write_queue_drops_, wq_size, spread / 1e6);
     }
 
     return true;
@@ -509,6 +573,7 @@ void EurocRecorder::write_grouped_frames(uint64_t avg_ts,
             if (video_pipes_[idx]) {
                 auto t0 = std::chrono::steady_clock::now();
                 size_t written = fwrite(entry.jpeg.data(), 1, entry.jpeg.size(), video_pipes_[idx]);
+                fflush(video_pipes_[idx]);  // push data to FFmpeg immediately
                 auto t1 = std::chrono::steady_clock::now();
                 auto write_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
@@ -517,15 +582,24 @@ void EurocRecorder::write_grouped_frames(uint64_t avg_ts,
                             write_ms, idx);
                 }
                 if (written != entry.jpeg.size()) {
-                    fprintf(stderr, "[recorder] Failed to write frame to video pipe cam%d\n", idx);
+                    fprintf(stderr, "[recorder] ERROR: Short write to video pipe cam%d (%zu/%zu bytes)\n",
+                            idx, written, entry.jpeg.size());
+                }
+                if (ferror(video_pipes_[idx])) {
+                    fprintf(stderr, "[recorder] ERROR: Video pipe error for cam%d, closing pipe\n", idx);
+                    pclose(video_pipes_[idx]);
+                    video_pipes_[idx] = nullptr;
                 }
             }
             // Write CSV entry
             if (cam_csv_[idx].is_open()) {
                 cam_csv_[idx] << avg_ts << "," << filename << "\n";
+                // Periodic CSV flush for video mode too
+                if (groups_written_ % CSV_FLUSH_INTERVAL == 0)
+                    cam_csv_[idx].flush();
             }
         } else {
-            // Queue async write task
+            // Queue async write task with backpressure
             WriteTask task;
             task.cam_idx = idx;
             task.timestamp_ns = avg_ts;
@@ -533,6 +607,13 @@ void EurocRecorder::write_grouped_frames(uint64_t avg_ts,
             task.csv_line = std::to_string(avg_ts) + "," + filename + "\n";
 
             std::lock_guard<std::mutex> lock(write_queue_mtx_);
+            if ((int)write_queue_.size() >= MAX_WRITE_QUEUE) {
+                write_queue_drops_++;
+                if (write_queue_drops_ % 100 == 1)
+                    fprintf(stderr, "[recorder] WARNING: Write queue full (%d), dropping frame for cam%d (total drops=%lu)\n",
+                            MAX_WRITE_QUEUE, idx, (unsigned long)write_queue_drops_);
+                continue;  // skip this frame
+            }
             write_queue_.push_back(std::move(task));
             write_queue_cv_.notify_one();
         }
@@ -620,17 +701,26 @@ void EurocRecorder::disk_writer_thread_func()
 {
     fprintf(stderr, "[recorder] Disk writer thread started\n");
 
-    while (disk_writer_running_.load() || !write_queue_.empty()) {
-        std::unique_lock<std::mutex> lock(write_queue_mtx_);
+    for (;;) {
+        WriteTask task;
+        {
+            std::unique_lock<std::mutex> lock(write_queue_mtx_);
 
-        if (write_queue_.empty()) {
-            write_queue_cv_.wait_for(lock, std::chrono::milliseconds(10));
-            continue;
+            // Wait for work or shutdown signal
+            write_queue_cv_.wait_for(lock, std::chrono::milliseconds(50), [this]() {
+                return !write_queue_.empty() || !disk_writer_running_.load();
+            });
+
+            if (write_queue_.empty()) {
+                if (!disk_writer_running_.load())
+                    break;  // clean shutdown, queue fully drained
+                continue;
+            }
+
+            task = std::move(write_queue_.front());
+            write_queue_.pop_front();
         }
-
-        WriteTask task = std::move(write_queue_.front());
-        write_queue_.pop_front();
-        lock.unlock();
+        // Lock released — do I/O outside critical section
 
         // Write JPEG file
         char filename[64];
@@ -639,17 +729,33 @@ void EurocRecorder::disk_writer_thread_func()
 
         FILE *fp = fopen(filepath.c_str(), "wb");
         if (fp) {
-            fwrite(task.jpeg.data(), 1, task.jpeg.size(), fp);
+            size_t written = fwrite(task.jpeg.data(), 1, task.jpeg.size(), fp);
+            if (written != task.jpeg.size()) {
+                fprintf(stderr, "[recorder] WARNING: Short write for %s (%zu/%zu bytes)\n",
+                        filepath.c_str(), written, task.jpeg.size());
+            }
             fclose(fp);
+        } else {
+            fprintf(stderr, "[recorder] ERROR: Cannot open %s: %s\n",
+                    filepath.c_str(), strerror(errno));
         }
 
         // Write CSV entry
         if (cam_csv_[task.cam_idx].is_open()) {
             cam_csv_[task.cam_idx] << task.csv_line;
+
+            // Periodic CSV flush to prevent data loss on crash
+            csv_flush_counter_++;
+            if (csv_flush_counter_ >= CSV_FLUSH_INTERVAL) {
+                csv_flush_counter_ = 0;
+                for (auto &csv : cam_csv_) {
+                    if (csv.is_open()) csv.flush();
+                }
+            }
         }
     }
 
-    // Flush all CSV files
+    // Final flush all CSV files
     for (auto &csv : cam_csv_) {
         if (csv.is_open()) csv.flush();
     }

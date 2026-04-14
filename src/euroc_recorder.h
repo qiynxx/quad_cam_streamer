@@ -46,6 +46,9 @@ private:
     static constexpr int RING_BUF_SIZE = 300;
     static constexpr int IMU_QUEUE_SIZE = 600;
     static constexpr int STATS_INTERVAL = 30;  // log every N groups
+    static constexpr int MAX_WRITE_QUEUE = 600; // max pending disk writes before dropping
+    static constexpr int CSV_FLUSH_INTERVAL = 30; // flush CSV every N writes
+    static constexpr uint64_t MIN_FREE_SPACE_MB = 500; // minimum free space to start recording
 
     struct FrameEntry {
         uint64_t timestamp_ns = 0;
@@ -60,7 +63,7 @@ private:
     void drain_imu();
     void drain_serial_imus();
     void disk_writer_thread_func();
-    bool is_sd_mounted() const;
+    std::string find_sd_mount_path() const;
     void write_body_yaml(const std::string &base_dir);
     void copy_sensor_yaml(const std::string &src, const std::string &dst);
 
@@ -126,4 +129,6 @@ private:
     // Stats
     uint64_t groups_written_ = 0;
     uint64_t frames_dropped_ = 0;
+    uint64_t write_queue_drops_ = 0;
+    int csv_flush_counter_ = 0;
 };
