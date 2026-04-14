@@ -7,13 +7,32 @@ PIDFILE=/var/run/quad_cam_streamer.pid
 case "$1" in
   start)
     echo "Starting quad_cam_streamer..."
-    # Unmute ES8388 codec outputs (mixer state is not persisted across reboots)
+
+    # 等 bluetoothd 进程起来
+    echo "  [wait] waiting for bluetoothd..."
+    while ! pidof bluetoothd >/dev/null 2>&1; do
+        sleep 1
+    done
+
+    # 等 hci0 出现（蓝牙适配器就绪）
+    echo "  [wait] waiting for hci0..."
+    while ! hciconfig hci0 >/dev/null 2>&1; do
+        sleep 1
+    done
+
+    # 再稍微给蓝牙一点缓冲时间（可调整）
+    sleep 2
+
+    # 打开音量
     amixer -q sset 'Master' 50% unmute 2>/dev/null || true
-    # Avoid rkaiq lock contention on boot
+    # 避免 rkaiq 锁
     killall rkaiq_3A_server rkaiq_tool_server 2>/dev/null
     rm -f /tmp/aiq*.lock
+
+    # 启动采集程序
     start-stop-daemon -S -b -m -p "$PIDFILE" -x "$DAEMON" -- "$CONFIG"
     ;;
+
   stop)
     echo "Stopping quad_cam_streamer..."
     start-stop-daemon -K -p "$PIDFILE" -x "$DAEMON"

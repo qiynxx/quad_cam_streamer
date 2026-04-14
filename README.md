@@ -85,12 +85,28 @@
 
 BLE 模式下，左右手 IMU 复用原来的 `imu_left` / `imu_right` ZMQ 端口与 EuRoC 录制目录，因此下游查看器和录制格式无需修改。ESP32 的 `timestamp_rk_ms` 会被换算成 `timestamp_ns`，并统一对齐到 RK 侧 `CLOCK_MONOTONIC` 时间线。
 
-BLE 配对操作：
-- 长按按键进入配对模式，扬声器快速双响提示。
-- 配对模式下，连接到一只手后周期双响，双手都就绪后周期三响。
-- 首次双手都就绪后，再次短按按键结束配对，并把左右手 BLE 地址写回 `config.json`。
-- 之后重启会根据保存的地址自动回连，不需要每次重新配对；如果需要更换设备，长按可再次进入配对模式覆盖原地址。
-- 任意一只手数据超时后，会触发 `IMU_DISCONNECT` 报错提示音。
+BLE 连接与配对行为（RK3576 端实际实现）：
+- 启动时，只要 `ble_imus.enabled: true` 且 DBus 初始化成功，程序会：
+  - 通过 `GetManagedObjects` 枚举 BlueZ 已知设备，识别 `ESP32S3-L` / `ESP32S3-R`；
+  - 调用 `Adapter1.StartDiscovery` 持续扫描；
+  - 若 `ble_imus.paired_left_addr` 和 `paired_right_addr` 已写入，则仅接受 MAC 匹配的左右手设备（Auto-resume 模式）。
+- 每只 ESP32 对应一个内部状态机：
+  - `WAIT_ADV` → `CONNECTING` → `DISCOVERING` → `SYNCING` → `STREAMING` → `RECONNECTING`。
+  - 每次 `Connect` 前会临时关闭扫描（`StopDiscovery`），避免“边扫边连”导致控制器/BlueZ 抖动；Connect 结束后再恢复扫描。
+  - 若 `Connect` 返回 `org.bluez.Error.Failed: Operation already in progress`，说明 BlueZ 认为该设备仍有上一轮连接尝试在进行中，此时会先调用 `Device1.CancelConnect` 显式取消本次连接，再在短延时（1s）后重试，避免长时间卡在“连接进行中”的状态。
+  - 若 `Connect` 超时（`Timeout was reached`），会调用 `Adapter1.RemoveDevice(obj_path)` 将该设备从 BlueZ 中移除，并从本地设备表删除，重新扫描等待新的 Device1 对象（避免陷入半连接状态）。
+  - 若 BlueZ 报 `UnknownObject`，说明 Device1 已经被移除，同样只删除本地设备条目，等待重新发现。
+  - 为防止启动早期 BlueZ 尚未完全就绪时漏掉设备，watchdog 线程在发现 `devs_` 为空时，会每隔 5 秒补跑一次 `GetManagedObjects`，直到至少发现一台 ESP32 设备；扫描标志 `scan_active_` 也会在 `StartDiscovery` 报 `InProgress` 时被置为已启动。
+  - 连接成功后会完成 GATT 发现、TimeSync Ping/Pong 同步、下发 `SetOffset`，并启用 IMU Notify，将 BLE IMU 数据转发到 5561/5562。
+- 时间同步采用简化 NTP 策略：每轮发送多次 Ping，丢弃 RTT 过大样本，从 RTT 最小的若干样本中取 offset 中位数，下发给 ESP32；后台每 10 秒对 STREAMING 设备做一次重同步，更新 offset 而不中断数据流。
+
+BLE 配对持久化与解绑：
+- 当左右手都进入 STREAMING 且当前还未写入 `paired_left_addr` / `paired_right_addr` 时，程序会自动将实际的左右手 MAC 保存到 `config.json` 中，用于下次启动的自动回连。
+- 板载按键的长按（时长由 `ble_imus.pair_long_press_ms` 控制，默认 1200ms）用于“解绑 + 重新扫描”：
+  - 清空运行时配置中的 `paired_left_addr` / `paired_right_addr` 并持久化；
+  - 断开所有当前 BLE 连接、取消订阅 notify、重置内部设备表和 BLE 输出槽；
+  - 确保 BLE 扫描重新开启，重新枚举 BlueZ 已知设备；
+  - 播放高音三连响作为解绑确认提示。
 
 串口 IMU 使用 31 字节二进制帧协议（含校验和），波特率最高支持 921600；当 `ble_imus.enabled: false` 时仍按旧逻辑工作。
 
@@ -114,8 +130,15 @@ BLE 配对操作：
 
 #### 按键与音频
 
-- **KeyMonitor**（`key_monitor.h`）：监听 Linux input 事件设备，自动识别 ADC 按键（`adc-keys`），支持短按/长按区分。默认短按用于录制切换，BLE 模式下长按进入配对、短按确认配对完成。
-- **AudioPlayer**（`audio_player.h`）：基于 ALSA PCM 合成音效，支持 BOOT、REC\_START/STOP、REC\_BEEP、REC\_ERROR、BLE 配对状态提示和 `IMU_DISCONNECT` 告警。
+- **KeyMonitor**（`key_monitor.h`）：监听 Linux input 事件设备，自动识别 ADC 按键（`adc-keys`），支持短按/长按区分。
+  - 短按：默认用于录制切换。
+  - 长按（BLE 模式启用时）：清空 BLE 配对（左右手 MAC）、断开当前连接并重新扫描，扬声器播放高音三连响作为解绑确认。
+- **AudioPlayer**（`audio_player.h`）：基于 ALSA PCM 合成音效，支持 BOOT、REC\_START/STOP、REC\_BEEP、REC\_ERROR、BLE 连接状态提示和 `IMU_DISCONNECT` 告警。
+
+BLE 连接数量对应的提示音（由 `BleImuManager::update_connection_audio` 控制）：
+- 0 只 BLE IMU 连接：每 2 秒播放一次双响（约 900 Hz，短双 beep），提示“还未连接任何 BLE IMU”。
+- 1 只 BLE IMU 连接：每 2 秒播放一次单响（约 1100 Hz），提示“仅有一只手已连接”。
+- 2 只 BLE IMU 连接：停止周期提示，播放一次单次长响（约 900 Hz，0.8 秒），提示“两只手都已连接且 IMU 数据正常推流”，并在首次达到该状态时自动持久化当前左右手 MAC。
 
 #### 运行时参数控制（`param_controller.h`）
 
