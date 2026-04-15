@@ -52,3 +52,6 @@ data/
 *.temp
 *.bak
 *.cache
+
+# Local RK3588 BLE peripheral tools (not tracked)
+tools/rk3588_ble_peripheral/

@@ -19,8 +19,13 @@
 
 namespace {
 
-constexpr const char *kTargetRightName = "ESP32S3-R";
-constexpr const char *kTargetLeftName = "ESP32S3-L";
+// Waist-mode target device: RK3588 side BLE peer.
+constexpr const char *kTargetWaistName = "RK3588-W";
+
+// Primary service UUID expected on the RK3588 side BLE peer. We use this to
+// disambiguate between multiple services that may expose the same
+// characteristic UUIDs (e.g. BlueZ experimental simulation services).
+constexpr const char *kUuidService = "12345678-1234-5678-1234-56789abcdeff";
 
 constexpr const char *kUuidImu = "12345678-1234-5678-1234-56789abcdef1";
 constexpr const char *kUuidControl = "12345678-1234-5678-1234-56789abcdef2";
@@ -30,6 +35,8 @@ constexpr const char *kUuidTimeSync = "12345678-1234-5678-1234-56789abcdef4";
 constexpr uint8_t kCmdPing = 0x01;
 constexpr uint8_t kCmdSetOffset = 0x02;
 constexpr uint8_t kCmdStopPattern = 0x04;
+constexpr uint8_t kCmdRecordStart = 0x10;
+constexpr uint8_t kCmdRecordStop = 0x11;
 constexpr uint8_t kRespPong = 0x81;
 
 constexpr double kDegToRad = M_PI / 180.0;
@@ -72,13 +79,14 @@ float unpack_float_le(const uint8_t *buf)
 
 bool is_target_name(const std::string &name)
 {
-    return name == kTargetLeftName || name == kTargetRightName;
+    // Waist mode: only care about the RK3588-W peer.
+    return name == kTargetWaistName;
 }
 
 BleHandRole role_from_name(const std::string &name)
 {
-    if (name == kTargetLeftName) return BleHandRole::LEFT;
-    if (name == kTargetRightName) return BleHandRole::RIGHT;
+    // In waist mode we reuse LEFT as the single logical output slot.
+    if (name == kTargetWaistName) return BleHandRole::LEFT;
     return BleHandRole::UNKNOWN;
 }
 
@@ -307,6 +315,8 @@ BleImuManager::BleImuManager(const BleImuConfig &cfg,
         out.cfg = cfg_out;
         outputs_.push_back(std::move(out));
     }
+    // Waist mode is defined as "only one logical BLE IMU output slot".
+    waist_mode_ = (outputs_.size() == 1);
 }
 
 BleImuManager::~BleImuManager()
@@ -781,6 +791,9 @@ void BleImuManager::connect_device(const std::shared_ptr<BleDevice> &dev)
 
     dev->state = DevState::DISCOVERING;
     LOG("[%s] Connected", dev->name.c_str());
+    // Best-effort: tighten LE connection parameters for this link to
+    // 7.5ms interval via hcitool. Failures are non-fatal.
+    request_fast_conn_params(*dev);
     discover_gatt(*dev);
     // 当前设备的 Connect 流程结束，重新开启扫描以便发现其他设备或后续重连。
     start_scan();
@@ -854,10 +867,34 @@ bool BleImuManager::discover_chars(BleDevice &dev)
 
     GVariant *objects = g_variant_get_child_value(managed, 0);
     GVariantIter obj_iter;
-    g_variant_iter_init(&obj_iter, objects);
-
     const gchar *obj_path = nullptr;
     GVariant *ifaces = nullptr;
+
+    // First pass: collect all GattService1 UUIDs so we can later filter
+    // characteristics by their parent service. This is important on hosts
+    // where BlueZ exposes multiple services with overlapping characteristic
+    // UUIDs (e.g. experimental simulation services).
+    std::map<std::string, std::string> service_uuids;
+    g_variant_iter_init(&obj_iter, objects);
+    while (g_variant_iter_loop(&obj_iter, "{&o@a{sa{sv}}}", &obj_path, &ifaces)) {
+        GVariant *svc_props = g_variant_lookup_value(
+            ifaces, "org.bluez.GattService1", G_VARIANT_TYPE("a{sv}"));
+        if (!svc_props)
+            continue;
+
+        GVariant *uuid_v = g_variant_lookup_value(
+            svc_props, "UUID", G_VARIANT_TYPE_STRING);
+        if (uuid_v) {
+            std::string uuid = g_variant_get_string(uuid_v, nullptr);
+            service_uuids[std::string(obj_path)] = uuid;
+            g_variant_unref(uuid_v);
+        }
+        g_variant_unref(svc_props);
+    }
+
+    // Second pass: find characteristics that belong to the target device AND
+    // whose parent service UUID matches kUuidService.
+    g_variant_iter_init(&obj_iter, objects);
     while (g_variant_iter_loop(&obj_iter, "{&o@a{sa{sv}}}", &obj_path, &ifaces)) {
         if (strncmp(obj_path, dev.obj_path.c_str(), dev.obj_path.size()) != 0)
             continue;
@@ -866,6 +903,21 @@ bool BleImuManager::discover_chars(BleDevice &dev)
             "org.bluez.GattCharacteristic1", G_VARIANT_TYPE("a{sv}"));
         if (!char_props)
             continue;
+
+        // Derive parent service path from characteristic object path.
+        std::string path_str = obj_path;
+        auto last_slash = path_str.rfind('/');
+        if (last_slash == std::string::npos) {
+            g_variant_unref(char_props);
+            continue;
+        }
+        std::string service_path = path_str.substr(0, last_slash);
+        auto svc_it = service_uuids.find(service_path);
+        if (svc_it == service_uuids.end() || svc_it->second != kUuidService) {
+            // Characteristic belongs to a different service; ignore it.
+            g_variant_unref(char_props);
+            continue;
+        }
 
         GVariant *uuid_v = g_variant_lookup_value(char_props, "UUID", G_VARIANT_TYPE_STRING);
         if (uuid_v) {
@@ -886,12 +938,16 @@ bool BleImuManager::discover_chars(BleDevice &dev)
 
 void BleImuManager::run_device_init(BleDevice &dev)
 {
+    // 简化版初始化：仅完成 GATT 发现和角色读取，不做时间同步 / Pattern 控制 /
+    // IMU Notify 启动。这样可以先把“连接 + 绑定 + 录制控制”跑通，后续再逐步启用
+    // 更复杂的同步逻辑。
     dev.state = DevState::SYNCING;
 
-    if (!enable_notify(dev.chars.timesync_path)) {
-        WARN("[%s] Failed to enable TimeSync notify", dev.name.c_str());
-    }
     auto *ts_ctx = new TimeSyncCtx{this, dev.addr};
+    if (!enable_notify(dev.chars.timesync_path)) {
+        WARN("[%s] Failed to enable TimeSync notify (sync disabled, continuing)", dev.name.c_str());
+        // 即便失败也不影响后续连接使用。
+    }
     dev.timesync_sub = subscribe_props(
         dbus_, dev.chars.timesync_path, timesync_notify_cb, ts_ctx,
         [](gpointer p) { delete static_cast<TimeSyncCtx *>(p); });
@@ -917,49 +973,15 @@ void BleImuManager::run_device_init(BleDevice &dev)
         g_error_free(err);
     }
 
-    if (!do_stop_pattern(dev))
-        WARN("[%s] StopPattern failed, continuing", dev.name.c_str());
-
-    int32_t offset = 0;
-    if (!do_time_sync(dev, offset)) {
-        ERR("[%s] Time sync failed", dev.name.c_str());
-        dev.state = DevState::WAIT_ADV;
-        auto retry_dev = [&]() -> std::shared_ptr<BleDevice> {
-            std::lock_guard<std::mutex> lk(devs_mu_);
-            auto it = devs_.find(dev.addr);
-            return (it != devs_.end()) ? it->second : nullptr;
-        }();
-        schedule_retry(retry_dev, 1500);
-        return;
-    }
-
-    if (!do_set_offset(dev, offset)) {
-        ERR("[%s] SetOffset failed", dev.name.c_str());
-        dev.state = DevState::WAIT_ADV;
-        auto retry_dev = [&]() -> std::shared_ptr<BleDevice> {
-            std::lock_guard<std::mutex> lk(devs_mu_);
-            auto it = devs_.find(dev.addr);
-            return (it != devs_.end()) ? it->second : nullptr;
-        }();
-        schedule_retry(retry_dev, 1500);
-        return;
-    }
-
-    if (!do_start_imu(dev)) {
-        ERR("[%s] Failed to start IMU notify", dev.name.c_str());
-        dev.state = DevState::WAIT_ADV;
-        auto retry_dev = [&]() -> std::shared_ptr<BleDevice> {
-            std::lock_guard<std::mutex> lk(devs_mu_);
-            auto it = devs_.find(dev.addr);
-            return (it != devs_.end()) ? it->second : nullptr;
-        }();
-        schedule_retry(retry_dev, 1500);
-        return;
-    }
-
     dev.state = DevState::STREAMING;
     dev.last_imu_ms = monotonic_ms();
-    LOG("[%s] BLE IMU streaming", dev.name.c_str());
+    LOG("[%s] BLE link ready (time sync / IMU streaming disabled)", dev.name.c_str());
+
+    // 在腰部模式下，一旦完成初始化就立即认为输出 ready，从而驱动连接状态
+    // 提示音（0/1 连接）。传统双手模式仍然依赖 IMU 数据首次到达时置 ready。
+    if (waist_mode_) {
+        set_output_ready(dev.role, true, /*play_alarm=*/false);
+    }
 
     // 当前设备已完成初始化并进入 STREAMING 状态，可以尝试连接下一个设备
     // （优先 RIGHT，其次 LEFT），避免同时对多台设备并发 Connect。
@@ -1027,6 +1049,55 @@ bool BleImuManager::do_start_imu(BleDevice &dev)
 
     uint8_t enable = 0x01;
     return write_char(dev.chars.control_path, &enable, 1);
+}
+
+void BleImuManager::request_fast_conn_params(const BleDevice &dev)
+{
+    // Use hcitool to issue an LE Connection Update on RK3576. We first need
+    // to discover the HCI handle corresponding to this peer address.
+    FILE *fp = popen("hcitool con", "r");
+    if (!fp) {
+        WARN("[%s] hcitool con failed (popen)", dev.name.c_str());
+        return;
+    }
+
+    char line[256];
+    int handle = -1;
+    while (fgets(line, sizeof(line), fp)) {
+        // Example line:
+        // "\t< LE 78:BE:81:73:97:38 handle 16 state 1 lm MASTER"
+        if (strstr(line, " LE ") && strstr(line, dev.addr.c_str())) {
+            const char *p = strstr(line, "handle");
+            if (p) {
+                unsigned int h = 0;
+                if (sscanf(p, "handle %u", &h) == 1) {
+                    handle = (int)h;
+                    break;
+                }
+            }
+        }
+    }
+    pclose(fp);
+
+    if (handle < 0) {
+        WARN("[%s] Could not find HCI handle for %s when requesting fast conn params",
+             dev.name.c_str(), dev.addr.c_str());
+        return;
+    }
+
+    char cmd[128];
+    // 6,6 -> 7.5ms interval; latency=0; timeout=100*10ms=1000ms
+    snprintf(cmd, sizeof(cmd),
+             "hcitool lecup %u 6 6 0 100 >/dev/null 2>&1",
+             (unsigned int)handle);
+    int ret = system(cmd);
+    if (ret != 0) {
+        WARN("[%s] hcitool lecup(handle=%u) failed, ret=%d",
+             dev.name.c_str(), (unsigned int)handle, ret);
+    } else {
+        LOG("[%s] Requested fast LE params via hcitool lecup(handle=%u, interval=7.5ms)",
+            dev.name.c_str(), (unsigned int)handle);
+    }
 }
 
 bool BleImuManager::send_ping(BleDevice &dev, int64_t t1_ms)
@@ -1209,6 +1280,14 @@ void BleImuManager::on_imu_notify(BleDevice &dev, GVariant *params)
 
     dev.last_imu_ms = monotonic_ms();
 
+    // 腰部模式下，IMU 数据仅作为“心跳”来维持 last_imu_ms，用于断线检测；
+    // 不再推送到 ZMQ 或 EuRoC，也不参与 ready 状态变化（ready 在 init 时设置）。
+    if (waist_mode_) {
+        g_variant_unref(val);
+        g_variant_unref(changed);
+        return;
+    }
+
     ImuSample sample{};
     bool became_ready = false;
     int serial_index = -1;
@@ -1272,6 +1351,56 @@ bool BleImuManager::write_char(const std::string &path,
     return true;
 }
 
+void BleImuManager::send_record_command(RecordCommand cmd)
+{
+    if (!running_.load())
+        return;
+
+    uint8_t opcode = 0;
+    switch (cmd) {
+    case RecordCommand::START:
+        opcode = kCmdRecordStart;
+        break;
+    case RecordCommand::STOP:
+        opcode = kCmdRecordStop;
+        break;
+    default:
+        return;
+    }
+
+    uint8_t buf[5];
+    buf[0] = opcode;
+    pack_u32_le(buf + 1, (uint32_t)(monotonic_ms() & 0xffffffffu));
+
+    std::shared_ptr<BleDevice> target;
+    {
+        std::lock_guard<std::mutex> lk(devs_mu_);
+        for (auto &kv : devs_) {
+            auto &dev = kv.second;
+            if (dev && dev->state == DevState::STREAMING) {
+                target = dev;
+                break;
+            }
+        }
+    }
+
+    if (!target) {
+        WARN("Record command %s ignored: no STREAMING BLE device",
+             cmd == RecordCommand::START ? "START" : "STOP");
+        return;
+    }
+
+    if (!write_char(target->chars.timesync_path, buf, sizeof(buf))) {
+        WARN("Failed to send record command %s to %s",
+             cmd == RecordCommand::START ? "START" : "STOP",
+             target->name.c_str());
+    } else {
+        LOG("Sent record command %s to %s",
+            cmd == RecordCommand::START ? "START" : "STOP",
+            target->name.c_str());
+    }
+}
+
 bool BleImuManager::enable_notify(const std::string &path)
 {
     GError *err = nullptr;
@@ -1291,123 +1420,34 @@ bool BleImuManager::enable_notify(const std::string &path)
 
 void BleImuManager::watchdog_loop()
 {
+    // 简化模式的 watchdog：不再做超时断线 / 自动重连 / 自动重启扫描，只在
+    // devs_ 为空时，周期性补一次 GetManagedObjects()，避免 BlueZ 在我们启
+    // 动之前已经创建好的 Device1 对象被错过。
     int64_t last_enum_ms = 0;
 
     while (running_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         const int64_t now_ms = monotonic_ms();
 
-        // 若在启动阶段 BlueZ 尚未就绪导致 StartDiscovery 失败，scan_active_
-        // 会一直是 false，从而无法发现任何 BLE 设备。这里在 watchdog 中做
-        // 兜底重试：只要扫描未开启，就周期性尝试调用 start_scan()，一旦
-        // BlueZ 准备好，StartDiscovery 成功后 scan_active_ 会被置为 true。
-        if (!scan_active_) {
-            start_scan();
-        }
-
-        // 若启动早于 BlueZ / 设备广播，初始的 GetManagedObjects 可能为空，
-        // devs_ 中长期看不到任何 ESP32 设备。实际使用中长按按键触发
-        // reset_pairing_and_rescan() + enumerate_known_devices() 能立即恢复，
-        // 说明周期性补一次 GetManagedObjects 即可修复。
-        //
-        // 这里做一个轻量级兜底：当 devs_ 为空时，每隔 5 秒调用一次
-        // enumerate_known_devices()，直到至少发现一台设备为止。
-        {
-            bool devs_empty = false;
-            {
-                std::lock_guard<std::mutex> lk(devs_mu_);
-                devs_empty = devs_.empty();
-            }
-            if (devs_empty && (now_ms - last_enum_ms >= 5000)) {
-                enumerate_known_devices();
-                last_enum_ms = now_ms;
-            }
-        }
-
-        std::vector<std::shared_ptr<BleDevice>> devices;
+        bool devs_empty = false;
         {
             std::lock_guard<std::mutex> lk(devs_mu_);
-            for (auto &kv : devs_)
-                devices.push_back(kv.second);
+            devs_empty = devs_.empty();
         }
 
-        for (const auto &dev : devices) {
-            if (!dev || dev->state != DevState::STREAMING)
-                continue;
-
-            const int64_t age_ms = now_ms - dev->last_imu_ms;
-            if (age_ms < cfg_.disconnect_timeout_ms)
-                continue;
-
-            ERR("[%s] IMU silent for %lldms, reconnecting",
-                dev->name.c_str(), (long long)age_ms);
-            dev->state = DevState::RECONNECTING;
-            set_output_ready(dev->role, false, true);
-            unsubscribe_device(*dev);
-            disconnect_device(*dev);
-            schedule_retry(dev, 1200);
-        }
-
-        if (!active_mode_.load())
-            continue;
-
-        // 当前至少有多少个输出是 ready 状态（用于区分“部分掉线”的告警场景）
-        const int ready_count = ready_hand_count();
-
-        std::vector<AudioPlayer::Sound> alarms;
-        {
-            std::lock_guard<std::mutex> lk(outputs_mu_);
-            for (auto &out : outputs_) {
-                if (out.ready || !out.alarm_active)
-                    continue;
-                if (now_ms - out.last_alarm_ms >= cfg_.disconnect_alarm_interval_ms) {
-                    out.last_alarm_ms = now_ms;
-                    alarms.push_back(AudioPlayer::Sound::IMU_DISCONNECT);
-                }
-            }
-        }
-        // 如果所有输出都已经不 ready（完全断开），只保留连接数量的节奏提示，
-        // 不再周期性播放 IMU_DISCONNECT 告警，避免两只手都关机时喇叭“乱响”。
-        if (ready_count > 0) {
-            for (auto sound : alarms) {
-                if (audio_)
-                    audio_->play(sound);
-            }
+        if (devs_empty && (now_ms - last_enum_ms >= 5000)) {
+            enumerate_known_devices();
+            last_enum_ms = now_ms;
         }
     }
 }
 
 void BleImuManager::resync_loop()
 {
+    // 时间同步功能在当前版本中暂时关闭，因此后台重同步线程仅保持空循环，
+    // 避免额外的 BLE 往返影响连接稳定性。
     while (running_.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(10));
-        if (!running_.load())
-            break;
-
-        std::vector<std::shared_ptr<BleDevice>> devices;
-        {
-            std::lock_guard<std::mutex> lk(devs_mu_);
-            for (auto &kv : devs_) {
-                if (kv.second->state == DevState::STREAMING)
-                    devices.push_back(kv.second);
-            }
-        }
-
-        for (const auto &dev : devices) {
-            if (!dev || dev->state != DevState::STREAMING)
-                continue;
-
-            int32_t offset = 0;
-            if (!run_sync_round(*dev, offset)) {
-                WARN("[%s] Periodic re-sync failed", dev->name.c_str());
-                continue;
-            }
-            if (!do_set_offset(*dev, offset)) {
-                WARN("[%s] Periodic SetOffset failed", dev->name.c_str());
-                continue;
-            }
-            LOG("[%s] Re-sync offset=%dms", dev->name.c_str(), offset);
-        }
     }
 }
 
@@ -1447,13 +1487,21 @@ void BleImuManager::update_connection_audio()
     const int ready = ready_hand_count();
     const int expected = expected_hand_count();
 
+    // 连响数量 = 需要连接的总数 - 已连接的数量：
+    //  - 0  -> 所有设备已连接，播放一次“全部就绪”长响并静音；
+    //  - 1  -> 每次只响一下（单 beep），用于腰部单设备或双手只连上一只；
+    //  - >=2 -> 每次响两下（双 beep），提示一个设备都还没连上。
+    int beep_count = expected - ready;
+    if (beep_count < 0)
+        beep_count = 0;
+
     int desired_state = -1;
-    if (ready <= 0) {
-        desired_state = 0;
-    } else if (ready == 1) {
-        desired_state = 1;
+    if (beep_count == 0) {
+        desired_state = 2;  // FULL: BLE_CONN_BOTH (one-shot long beep)
+    } else if (beep_count == 1) {
+        desired_state = 1;  // SINGLE: BLE_CONN_ONE
     } else {
-        desired_state = 2;
+        desired_state = 0;  // DOUBLE: BLE_CONN_ZERO
     }
 
     const int previous = connection_beep_state_.load();
@@ -1461,8 +1509,8 @@ void BleImuManager::update_connection_audio()
         return;
     connection_beep_state_ = desired_state;
 
-    // 0/1 连接：周期性提示；2 连接：长响一次并静音
-    if (desired_state <= 0) {
+    // 使用周期提示音表达“还需要多少设备连接”，全部就绪时播放一次长响并静音。
+    if (desired_state == 0) {
         audio_->start_status_ticker(AudioPlayer::Sound::BLE_CONN_ZERO, 2000);
     } else if (desired_state == 1) {
         audio_->start_status_ticker(AudioPlayer::Sound::BLE_CONN_ONE, 2000);
@@ -1601,6 +1649,12 @@ void BleImuManager::launch_worker(std::function<void()> fn)
 
 bool BleImuManager::has_saved_pairing() const
 {
+    const int expected = expected_hand_count();
+    if (expected <= 1) {
+        // 腰部模式：只要任意一侧保存了 MAC，就认为存在有效配对信息。
+        return !cfg_.paired_left_addr.empty() || !cfg_.paired_right_addr.empty();
+    }
+    // 双手模式：左右两只手的地址都存在才算完成配对。
     return !cfg_.paired_left_addr.empty() && !cfg_.paired_right_addr.empty();
 }
 
@@ -1637,6 +1691,12 @@ bool BleImuManager::collect_paired_addresses(std::string &left_addr, std::string
         else if (dev->role == BleHandRole::RIGHT)
             right_addr = dev->addr;
     }
+
+    const int expected = expected_hand_count();
+    if (expected <= 1) {
+        // 腰部模式：只要有一个地址即可。
+        return !left_addr.empty() || !right_addr.empty();
+    }
     return !left_addr.empty() && !right_addr.empty();
 }
 
@@ -1645,12 +1705,22 @@ bool BleImuManager::persist_current_pairing()
     std::string left_addr;
     std::string right_addr;
     if (!collect_paired_addresses(left_addr, right_addr)) {
-        ERR("Cannot persist BLE pairing: both hands are not streaming yet");
+        ERR("Cannot persist BLE pairing: required devices are not streaming yet");
         return false;
     }
 
-    cfg_.paired_left_addr = left_addr;
-    cfg_.paired_right_addr = right_addr;
+    const int expected = expected_hand_count();
+    if (expected <= 1) {
+        // 腰部模式：将发现的地址统一写入 left 槽位，right 可保持为空。
+        if (!left_addr.empty())
+            cfg_.paired_left_addr = left_addr;
+        else
+            cfg_.paired_left_addr = right_addr;
+        cfg_.paired_right_addr.clear();
+    } else {
+        cfg_.paired_left_addr = left_addr;
+        cfg_.paired_right_addr = right_addr;
+    }
 
     std::string error;
     if (!persist_ble_pairing_config(config_path_, cfg_, &error)) {

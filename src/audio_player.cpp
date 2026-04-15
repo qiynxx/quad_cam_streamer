@@ -222,9 +222,8 @@ void AudioPlayer::render_sound(Sound s)
         break;
 
     case Sound::BLE_CONN_ZERO:
-        // 0 连接：较温和的双响，提示“还未连接任何 BLE IMU”
+        // 需要连接数 - 已连接数 >= 2：使用双响提示“一个都没连上”。
         {
-            // 稍微拉长单次 beep 和两次之间的间隔，让双响更明显
             auto beep = make_tone(900.0f, 0.10f, 0.5f);
             auto sil  = make_silence(0.15f);
             samples.insert(samples.end(), beep.begin(), beep.end());

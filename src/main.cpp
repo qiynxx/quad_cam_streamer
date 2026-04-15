@@ -61,6 +61,8 @@ static BleHandRole infer_ble_hand_role(const SerialImuConfig &cfg)
     key = lower_copy(key);
     if (key.find("left") != std::string::npos)
         return BleHandRole::LEFT;
+    if (key.find("waist") != std::string::npos)
+        return BleHandRole::LEFT;  // 腰部 IMU 复用 LEFT 输出槽
     if (key.find("right") != std::string::npos)
         return BleHandRole::RIGHT;
     return BleHandRole::UNKNOWN;
@@ -706,6 +708,14 @@ int main(int argc, char *argv[])
     if (argc > 1)
         config_path = argv[1];
 
+    // Try to tighten default LE connection parameters on RK3576 to a 7.5ms
+    // interval, zero latency and 1s supervision timeout. This requires
+    // btmgmt to be available on the target; failures are ignored.
+    {
+        int ret = system("btmgmt --index 0 connparam 6 6 0 100 >/dev/null 2>&1");
+        (void)ret;
+    }
+
     fprintf(stderr, "quad_cam_streamer - loading config: %s\n", config_path);
 
     AppConfig cfg;
@@ -841,6 +851,11 @@ int main(int argc, char *argv[])
                               &long_press_requested, ble = ble_imu.get()]() {
             fprintf(stderr, "[keyctl] Handler thread started\n");
 
+            // 独立维护一份“远端录制状态”视图：无论本地 SD 是否挂载成功，
+            // 短按都会在此状态上做一次 START/STOP 翻转，从而保证 BLE 端
+            // 始终按照用户的按键节奏切换。
+            bool remote_recording = false;
+
             while (g_running.load()) {
                 if (long_press_requested.exchange(false)) {
                     if (ble) {
@@ -854,8 +869,32 @@ int main(int argc, char *argv[])
                 }
 
                 if (short_press_requested.exchange(false)) {
+                    bool was_recording = recorder.is_recording();
+                    bool now_recording = was_recording;
+                    // 用户在 BLE 远端的期望目标状态：基于上一轮远端状态做翻转，
+                    // 而不是依赖本地 recorder 是否真的进入录制状态。
+                    bool requested_start = !remote_recording;
+
                     if (cfg.recording.enabled) {
-                        recorder.toggle_recording();
+                        now_recording = recorder.toggle_recording();
+                    }
+
+                    // 无论本地录制是否成功切换，都按“用户意图”向 BLE 端发送一次
+                    // START/STOP 命令，保证远端始终跟随按键动作；本地 SD 卡错误
+                    // 会通过 recorder 内部日志和 REC_ERROR 提示出来。
+                    if (ble) {
+                        const char *action = requested_start ? "START" : "STOP";
+                        fprintf(stderr,
+                                "[keyctl] Short press -> intent %s recording "
+                                "(local before=%s after=%s), send BLE record %s\n",
+                                action,
+                                was_recording ? "ON" : "OFF",
+                                now_recording ? "ON" : "OFF",
+                                action);
+                        ble->send_record_command(
+                            requested_start ? RecordCommand::START
+                                            : RecordCommand::STOP);
+                        remote_recording = requested_start;
                     }
                 } else {
                     std::this_thread::sleep_for(std::chrono::milliseconds(50));

@@ -304,14 +304,20 @@ cd app/quad_cam_streamer
     "auto_resume": true,
     "pair_long_press_ms": 1200,
     "pairing_status_interval_ms": 2500,
-    "disconnect_timeout_ms": 2000,
+    "disconnect_timeout_ms": 15000,
     "disconnect_alarm_interval_ms": 5000,
     "paired_left_addr": "",
     "paired_right_addr": ""
   },
   "serial_imus": [
-    {"enabled": true, "name": "imu_left",  "role": "left",  "uart_device": "/dev/ttyS4",  "baudrate": 921600, "zmq_port": 5561},
-    {"enabled": true, "name": "imu_right", "role": "right", "uart_device": "/dev/ttyS10", "baudrate": 921600, "zmq_port": 5562}
+    {
+      "enabled": true,
+      "name": "imu_waist",
+      "role": "waist",
+      "uart_device": "/dev/ttyS4",
+      "baudrate": 921600,
+      "zmq_port": 5561
+    }
   ],
   "recording": {
     "enabled": true,
@@ -343,13 +349,13 @@ cd app/quad_cam_streamer
 | `cameras[].auto_exposure` | 启用软件自动曝光 |
 | `cameras[].use_rkaiq` | 启用 Rockchip ISP 3A（与 auto_exposure 二选一） |
 | `imu.rotation_matrix` | 传感器→机体坐标系 3×3 旋转矩阵 |
-| `ble_imus.enabled` | 启用 BLE 双手 IMU，替代串口读取路径 |
+| `ble_imus.enabled` | 启用 BLE IMU（双手或腰部），替代串口读取路径 |
 | `ble_imus.auto_resume` | 若已保存左右手地址，启动后自动回连 |
 | `ble_imus.pair_long_press_ms` | 进入 BLE 配对模式所需长按时长 |
 | `ble_imus.disconnect_timeout_ms` | BLE IMU 超时判定阈值 |
 | `ble_imus.paired_left_addr` | 首次成功配对后自动写入的左手 BLE 地址 |
 | `ble_imus.paired_right_addr` | 首次成功配对后自动写入的右手 BLE 地址 |
-| `serial_imus[].role` | BLE 模式下声明该输出槽位对应左手或右手 |
+| `serial_imus[].role` | BLE 模式下声明该输出槽位对应左手/右手/腰部 |
 | `recording.output_format` | `"image"`（JPEG 文件）或 `"video"`（AVI 容器） |
 | `recording.video_codec` | `"mjpeg"`（直接透传）或 `"h264"`（转码，需 FFmpeg） |
 | `recording.record_key_code` | 触发录制的 Linux input 按键码（115 = KEY_VOLUMEDOWN） |
@@ -366,8 +372,8 @@ cd app/quad_cam_streamer
 | 相机 2 (OV9281 #0) | 5552 | ZMQ PUB，JPEG 帧 |
 | 相机 3 (OV9281 #1) | 5553 | ZMQ PUB，JPEG 帧 |
 | I2C IMU | 5560 | ZMQ PUB，IMU 数据 |
-| 左手 IMU（BLE 或串口） | 5561 | ZMQ PUB，IMU 数据 |
-| 右手 IMU（BLE 或串口） | 5562 | ZMQ PUB，IMU 数据 |
+| 左手 / 腰部 IMU（BLE 或串口） | 5561 | ZMQ PUB，IMU 数据；在腰部 RK3588-W 模式下仅用于兼容，占位但默认不产生 IMU 推流 |
+| 右手 IMU（BLE 或串口） | 5562 | ZMQ PUB，IMU 数据（双手模式） |
 | 参数控制服务 | 5570 | ZMQ REP，JSON 命令接口 |
 
 ---

@@ -27,6 +27,12 @@ enum class BleHandRole {
     LEFT,
 };
 
+// Record control commands forwarded to the BLE peer (RK3588-W).
+enum class RecordCommand {
+    START,
+    STOP,
+};
+
 struct BleImuOutputConfig {
     BleHandRole hand = BleHandRole::UNKNOWN;
     std::string name;
@@ -64,6 +70,10 @@ public:
     // Reset stored BLE pairing (MAC addresses) and restart scan.
     // Intended to be called from the key handler on triple-press.
     void reset_pairing_and_rescan();
+
+    // Forward local recording state changes to the BLE peer. No-op if there is
+    // no active STREAMING device or BLE is not running.
+    void send_record_command(RecordCommand cmd);
 
 private:
     struct CharHandles {
@@ -158,6 +168,11 @@ private:
                     bool with_response = true);
     bool enable_notify(const std::string &path);
 
+    // Best-effort request to tighten LE connection parameters for a given
+    // device by calling `hcitool lecup` on RK3576. This operates at the HCI
+    // level and is intended only for latency tuning; failures are non-fatal.
+    void request_fast_conn_params(const BleDevice &dev);
+
     void watchdog_loop();
     void resync_loop();
 
@@ -180,6 +195,10 @@ private:
     std::vector<OutputChannel> outputs_;
     EurocRecorder &recorder_;
     AudioPlayer *audio_ = nullptr;
+    // Waist mode: only a single BLE device (RK3588-W) is expected. In this
+    // mode we do not forward IMU samples over ZMQ / EuRoC, and treat IMU
+    // notifications mainly as a heartbeat for disconnect detection.
+    bool waist_mode_ = false;
 
     GDBusConnection *dbus_ = nullptr;
     GMainLoop *loop_ = nullptr;
