@@ -21,6 +21,9 @@ namespace {
 
 constexpr const char *kTargetRightName = "ESP32S3-R";
 constexpr const char *kTargetLeftName = "ESP32S3-L";
+constexpr const char *kTargetWaistName = "RK3588-W";
+
+constexpr const char *kUuidService = "12345678-1234-5678-1234-56789abcdeff";
 
 constexpr const char *kUuidImu = "12345678-1234-5678-1234-56789abcdef1";
 constexpr const char *kUuidControl = "12345678-1234-5678-1234-56789abcdef2";
@@ -30,6 +33,8 @@ constexpr const char *kUuidTimeSync = "12345678-1234-5678-1234-56789abcdef4";
 constexpr uint8_t kCmdPing = 0x01;
 constexpr uint8_t kCmdSetOffset = 0x02;
 constexpr uint8_t kCmdStopPattern = 0x04;
+constexpr uint8_t kCmdRecordStart = 0x10;
+constexpr uint8_t kCmdRecordStop = 0x11;
 constexpr uint8_t kRespPong = 0x81;
 
 constexpr double kDegToRad = M_PI / 180.0;
@@ -72,13 +77,14 @@ float unpack_float_le(const uint8_t *buf)
 
 bool is_target_name(const std::string &name)
 {
-    return name == kTargetLeftName || name == kTargetRightName;
+    return name == kTargetLeftName || name == kTargetRightName || name == kTargetWaistName;
 }
 
 BleHandRole role_from_name(const std::string &name)
 {
     if (name == kTargetLeftName) return BleHandRole::LEFT;
     if (name == kTargetRightName) return BleHandRole::RIGHT;
+    if (name == kTargetWaistName) return BleHandRole::WAIST;
     return BleHandRole::UNKNOWN;
 }
 
@@ -87,6 +93,7 @@ const char *role_str(BleHandRole role)
     switch (role) {
     case BleHandRole::LEFT: return "left";
     case BleHandRole::RIGHT: return "right";
+    case BleHandRole::WAIST: return "waist";
     default: return "unknown";
     }
 }
@@ -346,23 +353,17 @@ bool BleImuManager::start()
     });
 
     if (has_saved_pairing()) {
-        LOG("Auto-resume BLE pairing: left=%s right=%s",
-            cfg_.paired_left_addr.c_str(), cfg_.paired_right_addr.c_str());
-    } else if (cfg_.auto_resume &&
-               (!cfg_.paired_left_addr.empty() || !cfg_.paired_right_addr.empty())) {
-        WARN("BLE pairing info incomplete, treating as unbound");
+        LOG("Auto-resume BLE pairing: left=%s right=%s waist=%s",
+            cfg_.paired_left_addr.c_str(), cfg_.paired_right_addr.c_str(),
+            cfg_.paired_waist_addr.c_str());
+
+        // Only scan and connect when we have saved pairing info to auto-resume.
+        enumerate_known_devices();
+        start_scan();
+        update_connection_audio();
+    } else {
+        LOG("No saved BLE pairing, waiting for long-press to enter pairing mode");
     }
-
-    // Always enumerate existing BlueZ devices once so we can pick up devices
-    // that were already known before this process started (important in
-    // unbound mode after previous runs).
-    enumerate_known_devices();
-
-    // Always start scanning for BLE IMU devices on startup.
-    start_scan();
-
-    // Initialize connection audio state for "0 connected" case.
-    update_connection_audio();
 
     LOG("BLE IMU manager started");
     return true;
@@ -588,25 +589,35 @@ void BleImuManager::enter_pairing_mode()
 {
     if (!running_.load())
         return;
-    if (pairing_mode_.exchange(true))
-        return;
 
-    if (active_mode_.exchange(false)) {
+    // Allow re-entry: reset flags first so we always start clean.
+    pairing_mode_ = false;
+    active_mode_ = true;
+    pairing_audio_state_ = -2;
+    connection_beep_state_ = -1;
+
+    // Suspend output
+    {
         std::lock_guard<std::mutex> lk(outputs_mu_);
         for (auto &out : outputs_) {
             out.ready = false;
             out.alarm_active = false;
         }
-        LOG("Suspending BLE IMU output and entering pairing mode");
-    } else {
-        LOG("Entering BLE pairing mode");
     }
 
+    // Stop any existing ticker before entering pairing mode
     if (audio_)
-        audio_->play(AudioPlayer::Sound::BLE_PAIR_ENTER);
+        audio_->stop_status_ticker();
 
+    pairing_mode_ = true;
+    active_mode_ = false;
+    LOG("Entering BLE pairing mode");
+
+    // Start scan and enumerate
     enumerate_known_devices();
     start_scan();
+
+    // Start pairing audio ticker (will play based on missing device count)
     update_pairing_audio();
 }
 
@@ -615,32 +626,75 @@ bool BleImuManager::finalize_pairing()
     if (!pairing_mode_.load())
         return active_mode_.load();
 
-    if (!can_finalize_pairing()) {
-        WARN("Cannot finalize BLE pairing: %d/%d hands ready",
-             ready_hand_count(), expected_hand_count());
-        if (audio_)
-            audio_->play(AudioPlayer::Sound::REC_ERROR);
-        return false;
+    // 1. Stop pairing audio immediately
+    if (audio_)
+        audio_->stop_status_ticker();
+
+    const int ready = ready_hand_count();
+
+    // 2. Save whatever is connected
+    if (ready > 0) {
+        if (!persist_current_pairing()) {
+            ERR("Failed to save pairing info");
+        } else {
+            LOG("BLE pairing saved (%d/%d devices) to %s",
+                ready, expected_hand_count(), config_path_.c_str());
+        }
+    } else {
+        LOG("Exiting pairing mode with no devices connected");
     }
 
-    if (!persist_current_pairing()) {
-        if (audio_)
-            audio_->play(AudioPlayer::Sound::REC_ERROR);
-        return false;
-    }
-
+    // 3. Exit pairing mode
     pairing_mode_ = false;
     active_mode_ = true;
-    update_pairing_audio();
-    LOG("BLE pairing complete, BLE IMU output enabled (saved to %s)",
-        config_path_.c_str());
+    pairing_audio_state_ = -2;
+    connection_beep_state_ = -1;
+
+    // 4. Purge devices that are not in saved pairing, to stop stale reconnects.
+    {
+        std::lock_guard<std::mutex> lk(devs_mu_);
+        for (auto it = devs_.begin(); it != devs_.end(); ) {
+            auto &dev = it->second;
+            if (!dev) { it = devs_.erase(it); continue; }
+            std::string saved = configured_addr_for(dev->role);
+            if (saved.empty() || saved != dev->addr) {
+                LOG("[%s] Removing unpaired device from devs_", dev->name.c_str());
+                unsubscribe_device(*dev);
+                disconnect_device(*dev);
+                it = devs_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // 5. Reset outputs for purged devices
+    {
+        std::lock_guard<std::mutex> lk(outputs_mu_);
+        for (auto &out : outputs_) {
+            std::string saved = configured_addr_for(out.cfg.hand);
+            if (saved.empty()) {
+                out.ready = false;
+                out.alarm_active = false;
+            }
+        }
+    }
+
+    // 6. Play exit confirmation
+    if (audio_)
+        audio_->play(AudioPlayer::Sound::BLE_PAIR_EXIT);
+
+    // 7. Start connection audio based on saved devices only
+    update_connection_audio();
+
+    LOG("Pairing mode exited");
     return true;
 }
 
 bool BleImuManager::can_finalize_pairing() const
 {
-    const int expected = expected_hand_count();
-    return expected > 0 && ready_hand_count() >= expected;
+    // 至少有一个设备 ready 就可以确认保存
+    return ready_hand_count() > 0;
 }
 
 int BleImuManager::ready_hand_count() const
@@ -671,8 +725,9 @@ void BleImuManager::dispatch_device_found(const std::string &path,
     if (expected_role == BleHandRole::UNKNOWN)
         return;
 
-    // If we have a full saved pairing, only accept devices whose MAC matches
-    // the stored address for the inferred hand. Otherwise treat as unbound.
+    // If we have saved pairing info, for each role that has a saved MAC,
+    // only accept devices whose MAC matches. Roles without saved addresses
+    // are ignored in auto-resume (they were not paired last time).
     if (has_saved_pairing()) {
         std::string configured = configured_addr_for(expected_role);
         if (configured.empty() || configured != addr)
@@ -781,6 +836,7 @@ void BleImuManager::connect_device(const std::shared_ptr<BleDevice> &dev)
 
     dev->state = DevState::DISCOVERING;
     LOG("[%s] Connected", dev->name.c_str());
+    request_fast_conn_params(*dev);
     discover_gatt(*dev);
     // 当前设备的 Connect 流程结束，重新开启扫描以便发现其他设备或后续重连。
     start_scan();
@@ -854,10 +910,33 @@ bool BleImuManager::discover_chars(BleDevice &dev)
 
     GVariant *objects = g_variant_get_child_value(managed, 0);
     GVariantIter obj_iter;
-    g_variant_iter_init(&obj_iter, objects);
-
     const gchar *obj_path = nullptr;
     GVariant *ifaces = nullptr;
+
+    // First pass: collect all GattService1 UUIDs so we can later filter
+    // characteristics by their parent service. Important on RK3588-W where
+    // BlueZ may expose multiple services with overlapping characteristic UUIDs.
+    std::map<std::string, std::string> service_uuids;
+    g_variant_iter_init(&obj_iter, objects);
+    while (g_variant_iter_loop(&obj_iter, "{&o@a{sa{sv}}}", &obj_path, &ifaces)) {
+        GVariant *svc_props = g_variant_lookup_value(
+            ifaces, "org.bluez.GattService1", G_VARIANT_TYPE("a{sv}"));
+        if (!svc_props)
+            continue;
+
+        GVariant *uuid_v = g_variant_lookup_value(
+            svc_props, "UUID", G_VARIANT_TYPE_STRING);
+        if (uuid_v) {
+            std::string uuid = g_variant_get_string(uuid_v, nullptr);
+            service_uuids[std::string(obj_path)] = uuid;
+            g_variant_unref(uuid_v);
+        }
+        g_variant_unref(svc_props);
+    }
+
+    // Second pass: find characteristics that belong to the target device AND
+    // whose parent service UUID matches kUuidService.
+    g_variant_iter_init(&obj_iter, objects);
     while (g_variant_iter_loop(&obj_iter, "{&o@a{sa{sv}}}", &obj_path, &ifaces)) {
         if (strncmp(obj_path, dev.obj_path.c_str(), dev.obj_path.size()) != 0)
             continue;
@@ -866,6 +945,22 @@ bool BleImuManager::discover_chars(BleDevice &dev)
             "org.bluez.GattCharacteristic1", G_VARIANT_TYPE("a{sv}"));
         if (!char_props)
             continue;
+
+        // For WAIST (RK3588-W) devices, filter characteristics by parent
+        // service UUID to avoid BlueZ services with overlapping char UUIDs.
+        // ESP32 devices don't need this filter.
+        if (dev.role == BleHandRole::WAIST) {
+            std::string path_str = obj_path;
+            auto last_slash = path_str.rfind('/');
+            if (last_slash != std::string::npos) {
+                std::string service_path = path_str.substr(0, last_slash);
+                auto svc_it = service_uuids.find(service_path);
+                if (svc_it != service_uuids.end() && svc_it->second != kUuidService) {
+                    g_variant_unref(char_props);
+                    continue;
+                }
+            }
+        }
 
         GVariant *uuid_v = g_variant_lookup_value(char_props, "UUID", G_VARIANT_TYPE_STRING);
         if (uuid_v) {
@@ -907,7 +1002,11 @@ void BleImuManager::run_device_init(BleDevice &dev)
         gsize n = 0;
         const uint8_t *bytes = (const uint8_t *)g_variant_get_fixed_array(ay, &n, 1);
         if (n >= 1) {
-            dev.role = (bytes[0] == 0x01) ? BleHandRole::LEFT : BleHandRole::RIGHT;
+            // WAIST role is determined by device name (RK3588-W), not config byte.
+            // Only override for ESP32 devices where config byte determines L/R.
+            if (dev.role != BleHandRole::WAIST) {
+                dev.role = (bytes[0] == 0x01) ? BleHandRole::LEFT : BleHandRole::RIGHT;
+            }
             LOG("[%s] Config read: hand=%s", dev.name.c_str(), role_str(dev.role));
         }
         g_variant_unref(ay);
@@ -920,49 +1019,35 @@ void BleImuManager::run_device_init(BleDevice &dev)
     if (!do_stop_pattern(dev))
         WARN("[%s] StopPattern failed, continuing", dev.name.c_str());
 
+    // Time sync: best-effort for all devices. RK3588-W may not respond to
+    // pings (no pong), in which case sync fails gracefully with offset=0.
     int32_t offset = 0;
-    if (!do_time_sync(dev, offset)) {
-        ERR("[%s] Time sync failed", dev.name.c_str());
-        dev.state = DevState::WAIT_ADV;
-        auto retry_dev = [&]() -> std::shared_ptr<BleDevice> {
-            std::lock_guard<std::mutex> lk(devs_mu_);
-            auto it = devs_.find(dev.addr);
-            return (it != devs_.end()) ? it->second : nullptr;
-        }();
-        schedule_retry(retry_dev, 1500);
-        return;
+    if (do_time_sync(dev, offset)) {
+        if (!do_set_offset(dev, offset))
+            WARN("[%s] SetOffset failed, continuing with offset=0", dev.name.c_str());
+    } else {
+        WARN("[%s] Time sync failed, continuing with offset=0", dev.name.c_str());
     }
 
-    if (!do_set_offset(dev, offset)) {
-        ERR("[%s] SetOffset failed", dev.name.c_str());
-        dev.state = DevState::WAIT_ADV;
-        auto retry_dev = [&]() -> std::shared_ptr<BleDevice> {
-            std::lock_guard<std::mutex> lk(devs_mu_);
-            auto it = devs_.find(dev.addr);
-            return (it != devs_.end()) ? it->second : nullptr;
-        }();
-        schedule_retry(retry_dev, 1500);
-        return;
-    }
-
-    if (!do_start_imu(dev)) {
-        ERR("[%s] Failed to start IMU notify", dev.name.c_str());
-        dev.state = DevState::WAIT_ADV;
-        auto retry_dev = [&]() -> std::shared_ptr<BleDevice> {
-            std::lock_guard<std::mutex> lk(devs_mu_);
-            auto it = devs_.find(dev.addr);
-            return (it != devs_.end()) ? it->second : nullptr;
-        }();
-        schedule_retry(retry_dev, 1500);
-        return;
+    // IMU notify: only for devices that transmit IMU data (ESP32).
+    // WAIST (RK3588-W) only receives recording commands, no IMU output.
+    if (dev.role != BleHandRole::WAIST) {
+        if (!do_start_imu(dev))
+            WARN("[%s] Failed to start IMU notify, continuing", dev.name.c_str());
     }
 
     dev.state = DevState::STREAMING;
     dev.last_imu_ms = monotonic_ms();
-    LOG("[%s] BLE IMU streaming", dev.name.c_str());
+    LOG("[%s] BLE device ready (sync_offset=%dms)", dev.name.c_str(), offset);
 
-    // 当前设备已完成初始化并进入 STREAMING 状态，可以尝试连接下一个设备
-    // （优先 RIGHT，其次 LEFT），避免同时对多台设备并发 Connect。
+    // 主动标记 output ready，驱动连接状态提示音。
+    // 对于 WAIST 等可能没有 IMU notify 的设备也需要在此置 ready。
+    set_output_ready(dev.role, true, /*play_alarm=*/false);
+
+    if (pairing_mode_.load())
+        update_pairing_audio();
+
+    // 当前设备已完成初始化，尝试连接下一个设备。
     try_connect_next();
 }
 
@@ -1027,6 +1112,104 @@ bool BleImuManager::do_start_imu(BleDevice &dev)
 
     uint8_t enable = 0x01;
     return write_char(dev.chars.control_path, &enable, 1);
+}
+
+void BleImuManager::request_fast_conn_params(const BleDevice &dev)
+{
+    // Use hcitool to issue an LE Connection Update. We first need to discover
+    // the HCI handle corresponding to this peer address.
+    FILE *fp = popen("hcitool con", "r");
+    if (!fp) {
+        WARN("[%s] hcitool con failed (popen)", dev.name.c_str());
+        return;
+    }
+
+    char line[256];
+    int handle = -1;
+    while (fgets(line, sizeof(line), fp)) {
+        if (strstr(line, " LE ") && strstr(line, dev.addr.c_str())) {
+            const char *p = strstr(line, "handle");
+            if (p) {
+                unsigned int h = 0;
+                if (sscanf(p, "handle %u", &h) == 1) {
+                    handle = (int)h;
+                    break;
+                }
+            }
+        }
+    }
+    pclose(fp);
+
+    if (handle < 0) {
+        WARN("[%s] Could not find HCI handle for %s",
+             dev.name.c_str(), dev.addr.c_str());
+        return;
+    }
+
+    char cmd[128];
+    // 6,6 -> 7.5ms interval; latency=0; timeout=100*10ms=1000ms
+    snprintf(cmd, sizeof(cmd),
+             "hcitool lecup %u 6 6 0 100 >/dev/null 2>&1",
+             (unsigned int)handle);
+    int ret = system(cmd);
+    if (ret != 0) {
+        WARN("[%s] hcitool lecup(handle=%u) failed, ret=%d",
+             dev.name.c_str(), (unsigned int)handle, ret);
+    } else {
+        LOG("[%s] Requested fast LE params via hcitool lecup(handle=%u, interval=7.5ms)",
+            dev.name.c_str(), (unsigned int)handle);
+    }
+}
+
+void BleImuManager::send_record_command(RecordCommand cmd)
+{
+    if (!running_.load())
+        return;
+
+    uint8_t opcode = 0;
+    switch (cmd) {
+    case RecordCommand::START:
+        opcode = kCmdRecordStart;
+        break;
+    case RecordCommand::STOP:
+        opcode = kCmdRecordStop;
+        break;
+    default:
+        return;
+    }
+
+    uint8_t buf[5];
+    buf[0] = opcode;
+    pack_u32_le(buf + 1, (uint32_t)(monotonic_ms() & 0xffffffffu));
+
+    std::shared_ptr<BleDevice> target;
+    {
+        std::lock_guard<std::mutex> lk(devs_mu_);
+        for (auto &kv : devs_) {
+            auto &dev = kv.second;
+            if (dev && dev->state == DevState::STREAMING &&
+                dev->role == BleHandRole::WAIST) {
+                target = dev;
+                break;
+            }
+        }
+    }
+
+    if (!target) {
+        WARN("Record command %s ignored: no STREAMING waist device",
+             cmd == RecordCommand::START ? "START" : "STOP");
+        return;
+    }
+
+    if (!write_char(target->chars.timesync_path, buf, sizeof(buf))) {
+        WARN("Failed to send record command %s to %s",
+             cmd == RecordCommand::START ? "START" : "STOP",
+             target->name.c_str());
+    } else {
+        LOG("Sent record command %s to %s",
+            cmd == RecordCommand::START ? "START" : "STOP",
+            target->name.c_str());
+    }
 }
 
 bool BleImuManager::send_ping(BleDevice &dev, int64_t t1_ms)
@@ -1335,6 +1518,10 @@ void BleImuManager::watchdog_loop()
             if (!dev || dev->state != DevState::STREAMING)
                 continue;
 
+            // WAIST device does not send IMU data; skip timeout check.
+            if (dev->role == BleHandRole::WAIST)
+                continue;
+
             const int64_t age_ms = now_ms - dev->last_imu_ms;
             if (age_ms < cfg_.disconnect_timeout_ms)
                 continue;
@@ -1379,8 +1566,13 @@ void BleImuManager::watchdog_loop()
 
 void BleImuManager::resync_loop()
 {
+    // Stagger re-syncs: one device at a time, with a gap between each device
+    // and between rounds, to avoid BLE controller congestion (ATT 0x11).
+    constexpr int kRoundIntervalSec = 30;   // interval between full rounds
+    constexpr int kDeviceGapMs = 3000;      // gap between syncing two devices
+
     while (running_.load()) {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
+        std::this_thread::sleep_for(std::chrono::seconds(kRoundIntervalSec));
         if (!running_.load())
             break;
 
@@ -1388,25 +1580,28 @@ void BleImuManager::resync_loop()
         {
             std::lock_guard<std::mutex> lk(devs_mu_);
             for (auto &kv : devs_) {
-                if (kv.second->state == DevState::STREAMING)
+                if (kv.second && kv.second->state == DevState::STREAMING)
                     devices.push_back(kv.second);
             }
         }
 
         for (const auto &dev : devices) {
+            if (!running_.load())
+                break;
             if (!dev || dev->state != DevState::STREAMING)
                 continue;
 
             int32_t offset = 0;
             if (!run_sync_round(*dev, offset)) {
                 WARN("[%s] Periodic re-sync failed", dev->name.c_str());
-                continue;
-            }
-            if (!do_set_offset(*dev, offset)) {
+            } else if (!do_set_offset(*dev, offset)) {
                 WARN("[%s] Periodic SetOffset failed", dev->name.c_str());
-                continue;
+            } else {
+                LOG("[%s] Re-sync offset=%dms", dev->name.c_str(), offset);
             }
-            LOG("[%s] Re-sync offset=%dms", dev->name.c_str(), offset);
+
+            // Wait before syncing the next device
+            std::this_thread::sleep_for(std::chrono::milliseconds(kDeviceGapMs));
         }
     }
 }
@@ -1416,26 +1611,43 @@ void BleImuManager::update_pairing_audio()
     if (!audio_)
         return;
 
-    if (!pairing_mode_.load())
+    if (!pairing_mode_.load()) {
+        // pairing mode 已退出，停止 ticker
+        audio_->stop_status_ticker();
         return;
+    }
 
-    int desired_state = -1;
     const int ready = ready_hand_count();
-    desired_state = (ready >= 2) ? 2 : ready;
+    const int expected = expected_hand_count();
+    int missing = expected - ready;
+    if (missing < 0) missing = 0;
+
+    // missing 数量决定提示音：
+    //  >=3 → 三声滴滴滴 (BLE_PAIR_BOTH)
+    //    2 → 两声滴滴   (BLE_PAIR_ONE)
+    //    1 → 一声滴     (BLE_CONN_ONE)
+    //    0 → 全部连上，长响一次 (BLE_CONN_BOTH)
+    int desired_state = missing;
+    if (desired_state > 3) desired_state = 3;
 
     const int previous = pairing_audio_state_.load();
     if (desired_state == previous)
         return;
     pairing_audio_state_ = desired_state;
 
-    if (desired_state <= 0) {
-        audio_->stop_status_ticker();
-    } else if (desired_state == 1) {
-        audio_->start_status_ticker(AudioPlayer::Sound::BLE_PAIR_ONE,
-                                    cfg_.pairing_status_interval_ms);
-    } else {
+    if (desired_state >= 3) {
         audio_->start_status_ticker(AudioPlayer::Sound::BLE_PAIR_BOTH,
                                     cfg_.pairing_status_interval_ms);
+    } else if (desired_state == 2) {
+        audio_->start_status_ticker(AudioPlayer::Sound::BLE_PAIR_ONE,
+                                    cfg_.pairing_status_interval_ms);
+    } else if (desired_state == 1) {
+        audio_->start_status_ticker(AudioPlayer::Sound::BLE_CONN_ONE,
+                                    cfg_.pairing_status_interval_ms);
+    } else {
+        // 全部连上
+        audio_->stop_status_ticker();
+        audio_->play(AudioPlayer::Sound::BLE_CONN_BOTH);
     }
 }
 
@@ -1444,16 +1656,28 @@ void BleImuManager::update_connection_audio()
     if (!audio_)
         return;
 
+    // 正常连接模式下，expected 基于已保存配对的设备数量（而非 output 槽位总数）。
+    // 这样只配对了 1 个设备时，连上那 1 个就不再告警。
     const int ready = ready_hand_count();
-    const int expected = expected_hand_count();
+    const int expected = saved_device_count();
+
+    // 没有保存任何配对 → 静音（等用户长按进入配对模式）
+    if (expected <= 0) {
+        audio_->stop_status_ticker();
+        return;
+    }
+
+    int beep_count = expected - ready;
+    if (beep_count < 0)
+        beep_count = 0;
 
     int desired_state = -1;
-    if (ready <= 0) {
-        desired_state = 0;
-    } else if (ready == 1) {
-        desired_state = 1;
+    if (beep_count == 0) {
+        desired_state = 2;  // FULL: BLE_CONN_BOTH (one-shot long beep)
+    } else if (beep_count == 1) {
+        desired_state = 1;  // SINGLE: BLE_CONN_ONE
     } else {
-        desired_state = 2;
+        desired_state = 0;  // DOUBLE: BLE_CONN_ZERO
     }
 
     const int previous = connection_beep_state_.load();
@@ -1461,8 +1685,7 @@ void BleImuManager::update_connection_audio()
         return;
     connection_beep_state_ = desired_state;
 
-    // 0/1 连接：周期性提示；2 连接：长响一次并静音
-    if (desired_state <= 0) {
+    if (desired_state == 0) {
         audio_->start_status_ticker(AudioPlayer::Sound::BLE_CONN_ZERO, 2000);
     } else if (desired_state == 1) {
         audio_->start_status_ticker(AudioPlayer::Sound::BLE_CONN_ONE, 2000);
@@ -1470,8 +1693,11 @@ void BleImuManager::update_connection_audio()
         audio_->stop_status_ticker();
         audio_->play(AudioPlayer::Sound::BLE_CONN_BOTH);
 
-        // 当两只手都 ready 时，如果尚未保存配对信息，则自动持久化
-        if (ready >= expected && expected > 0 && !has_saved_pairing() && !pairing_persisted_) {
+        // 当所有已保存设备都 ready 时，如果尚未保存配对信息，则自动持久化。
+        // 配对模式下不自动保存（由 finalize_pairing 显式触发）。
+        if (!pairing_mode_.load() &&
+            ready >= expected && expected > 0 &&
+            !pairing_persisted_) {
             if (persist_current_pairing()) {
                 pairing_persisted_ = true;
             }
@@ -1501,26 +1727,16 @@ void BleImuManager::try_connect_next()
             }
         }
 
-        // 优先选择 RIGHT 手（ESP32S3-R）
-        for (auto &kv : devs_) {
-            const auto &d = kv.second;
-            if (!d) continue;
-            if ((d->state == DevState::WAIT_ADV ||
-                 d->state == DevState::RECONNECTING) &&
-                d->role == BleHandRole::RIGHT) {
-                candidate = d;
-                break;
-            }
-        }
-
-        // 如果没有 RIGHT，再选择 LEFT
-        if (!candidate) {
+        // 按优先级选择下一个要连接的设备：RIGHT → LEFT → WAIST
+        const BleHandRole priority[] = {BleHandRole::RIGHT, BleHandRole::LEFT, BleHandRole::WAIST};
+        for (auto role : priority) {
+            if (candidate) break;
             for (auto &kv : devs_) {
                 const auto &d = kv.second;
                 if (!d) continue;
                 if ((d->state == DevState::WAIT_ADV ||
                      d->state == DevState::RECONNECTING) &&
-                    d->role == BleHandRole::LEFT) {
+                    d->role == role) {
                     candidate = d;
                     break;
                 }
@@ -1601,7 +1817,16 @@ void BleImuManager::launch_worker(std::function<void()> fn)
 
 bool BleImuManager::has_saved_pairing() const
 {
-    return !cfg_.paired_left_addr.empty() && !cfg_.paired_right_addr.empty();
+    return saved_device_count() > 0;
+}
+
+int BleImuManager::saved_device_count() const
+{
+    int count = 0;
+    if (!cfg_.paired_left_addr.empty()) count++;
+    if (!cfg_.paired_right_addr.empty()) count++;
+    if (!cfg_.paired_waist_addr.empty()) count++;
+    return count;
 }
 
 std::string BleImuManager::configured_addr_for(BleHandRole hand) const
@@ -1611,6 +1836,8 @@ std::string BleImuManager::configured_addr_for(BleHandRole hand) const
         return cfg_.paired_left_addr;
     case BleHandRole::RIGHT:
         return cfg_.paired_right_addr;
+    case BleHandRole::WAIST:
+        return cfg_.paired_waist_addr;
     default:
         return "";
     }
@@ -1622,10 +1849,13 @@ BleHandRole BleImuManager::role_from_configured_addr(const std::string &addr) co
         return BleHandRole::LEFT;
     if (!cfg_.paired_right_addr.empty() && addr == cfg_.paired_right_addr)
         return BleHandRole::RIGHT;
+    if (!cfg_.paired_waist_addr.empty() && addr == cfg_.paired_waist_addr)
+        return BleHandRole::WAIST;
     return BleHandRole::UNKNOWN;
 }
 
-bool BleImuManager::collect_paired_addresses(std::string &left_addr, std::string &right_addr) const
+bool BleImuManager::collect_paired_addresses(std::string &left_addr, std::string &right_addr,
+                                              std::string &waist_addr) const
 {
     std::lock_guard<std::mutex> lk(devs_mu_);
     for (const auto &kv : devs_) {
@@ -1636,21 +1866,26 @@ bool BleImuManager::collect_paired_addresses(std::string &left_addr, std::string
             left_addr = dev->addr;
         else if (dev->role == BleHandRole::RIGHT)
             right_addr = dev->addr;
+        else if (dev->role == BleHandRole::WAIST)
+            waist_addr = dev->addr;
     }
-    return !left_addr.empty() && !right_addr.empty();
+    // 只要至少有一个设备 STREAMING 就认为收集成功
+    return !left_addr.empty() || !right_addr.empty() || !waist_addr.empty();
 }
 
 bool BleImuManager::persist_current_pairing()
 {
     std::string left_addr;
     std::string right_addr;
-    if (!collect_paired_addresses(left_addr, right_addr)) {
-        ERR("Cannot persist BLE pairing: both hands are not streaming yet");
+    std::string waist_addr;
+    if (!collect_paired_addresses(left_addr, right_addr, waist_addr)) {
+        ERR("Cannot persist BLE pairing: no devices are streaming yet");
         return false;
     }
 
     cfg_.paired_left_addr = left_addr;
     cfg_.paired_right_addr = right_addr;
+    cfg_.paired_waist_addr = waist_addr;
 
     std::string error;
     if (!persist_ble_pairing_config(config_path_, cfg_, &error)) {
@@ -1659,16 +1894,23 @@ bool BleImuManager::persist_current_pairing()
         return false;
     }
 
-    LOG("Saved BLE pairing: left=%s right=%s",
-        cfg_.paired_left_addr.c_str(), cfg_.paired_right_addr.c_str());
+    LOG("Saved BLE pairing: left=%s right=%s waist=%s",
+        cfg_.paired_left_addr.c_str(), cfg_.paired_right_addr.c_str(),
+        cfg_.paired_waist_addr.c_str());
     return true;
 }
 
 void BleImuManager::reset_pairing_and_rescan()
 {
-    // Clear persisted MAC addresses
+    // Reset mode flags so that enter_pairing_mode() can re-enter cleanly.
+    pairing_mode_ = false;
+    active_mode_ = true;
+    pairing_audio_state_ = -2;
+
+    // Clear persisted MAC addresses for all 3 device roles
     cfg_.paired_left_addr.clear();
     cfg_.paired_right_addr.clear();
+    cfg_.paired_waist_addr.clear();
     pairing_persisted_ = false;
 
     std::string error;
@@ -1714,14 +1956,9 @@ void BleImuManager::reset_pairing_and_rescan()
         audio_->stop_status_ticker();
     }
     connection_beep_state_ = -1;
-    update_connection_audio();
 
-    if (!scan_active_) {
-        start_scan();
-    }
+    // Stop scan so enter_pairing_mode can restart it cleanly
+    stop_scan();
 
-    // 重新枚举 BlueZ 已知设备，保证已经存在的 ESP32 也能被重新连接
-    enumerate_known_devices();
-
-    LOG("BLE pairing reset: cleared stored MACs and restarted scan");
+    LOG("BLE pairing reset: cleared stored MACs, ready for enter_pairing_mode()");
 }

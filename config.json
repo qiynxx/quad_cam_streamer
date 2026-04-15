@@ -21,7 +21,7 @@
       "analogue_gain": 16,
       "ae_target_brightness": 100,
       "ae_max_analogue_gain": 96,
-      "use_rkaiq": false,
+      "use_rkaiq": true,
       "sensor_entity_name": "m01_b_imx334 5-0036",
       "iq_file_dir": "/etc/iqfiles"
     },
@@ -41,13 +41,13 @@
       "analogue_gain": 16,
       "ae_target_brightness": 100,
       "ae_max_analogue_gain": 96,
-      "use_rkaiq": false,
+      "use_rkaiq": true,
       "sensor_entity_name": "m00_b_imx334 4-001a",
       "iq_file_dir": "/etc/iqfiles"
     },
     {
       "name": "m02_b_ov9281 8-0060",
-      "enabled": true,
+      "enabled": false,
       "device": "/dev/video62",
       "subdev": "/dev/v4l-subdev13",
       "width": 1280,
@@ -65,7 +65,7 @@
     },
     {
       "name": "m03_b_ov9281 9-0060",
-      "enabled": true,
+      "enabled": false,
       "device": "/dev/video71",
       "subdev": "/dev/v4l-subdev18",
       "width": 1280,
@@ -99,12 +99,13 @@
   "ble_imus": {
     "enabled": true,
     "auto_resume": true,
-    "pair_long_press_ms": 1200,
+    "pair_long_press_ms": 3000,
     "pairing_status_interval_ms": 2500,
     "disconnect_timeout_ms": 2000,
     "disconnect_alarm_interval_ms": 5000,
     "paired_left_addr": "",
-    "paired_right_addr": ""
+    "paired_right_addr": "",
+    "paired_waist_addr": ""
   },
   "serial_imus": [
     {
@@ -122,6 +123,14 @@
       "uart_device": "/dev/ttyS10",
       "baudrate": 921600,
       "zmq_port": 5562
+    },
+    {
+      "enabled": true,
+      "name": "imu_waist",
+      "role": "waist",
+      "uart_device": "/dev/ttyS0",
+      "baudrate": 921600,
+      "zmq_port": 5563
     }
   ],
   "recording": {

@@ -63,6 +63,8 @@ static BleHandRole infer_ble_hand_role(const SerialImuConfig &cfg)
         return BleHandRole::LEFT;
     if (key.find("right") != std::string::npos)
         return BleHandRole::RIGHT;
+    if (key.find("waist") != std::string::npos)
+        return BleHandRole::WAIST;
     return BleHandRole::UNKNOWN;
 }
 
@@ -72,6 +74,7 @@ static std::vector<BleImuOutputConfig> build_ble_outputs(const AppConfig &cfg)
     int serial_index = 0;
     bool have_left = false;
     bool have_right = false;
+    bool have_waist = false;
 
     for (const auto &sc : cfg.serial_imus) {
         if (!sc.enabled)
@@ -85,7 +88,8 @@ static std::vector<BleImuOutputConfig> build_ble_outputs(const AppConfig &cfg)
             continue;
         }
         if ((hand == BleHandRole::LEFT && have_left) ||
-            (hand == BleHandRole::RIGHT && have_right)) {
+            (hand == BleHandRole::RIGHT && have_right) ||
+            (hand == BleHandRole::WAIST && have_waist)) {
             fprintf(stderr, "[ble_imu] Warning: duplicate BLE output role for '%s', skipping\n",
                     sc.name.c_str());
             serial_index++;
@@ -101,6 +105,7 @@ static std::vector<BleImuOutputConfig> build_ble_outputs(const AppConfig &cfg)
 
         if (hand == BleHandRole::LEFT) have_left = true;
         if (hand == BleHandRole::RIGHT) have_right = true;
+        if (hand == BleHandRole::WAIST) have_waist = true;
         serial_index++;
     }
 
@@ -834,10 +839,10 @@ int main(int argc, char *argv[])
                     short_press_requested.store(true);
                     key_cv.notify_one();
                 },
-                cfg.ble_imus.enabled ? KeyMonitor::Callback([&long_press_requested, &key_cv]() {
+                [&long_press_requested, &key_cv]() {
                     long_press_requested.store(true);
                     key_cv.notify_one();
-                }) : KeyMonitor::Callback(),
+                },
                 cfg.ble_imus.enabled ? cfg.ble_imus.pair_long_press_ms : 1200);
             km.run(g_running);
         });
@@ -848,7 +853,6 @@ int main(int argc, char *argv[])
             fprintf(stderr, "[keyctl] Handler thread started\n");
 
             while (g_running.load()) {
-                // Wait for key event or periodic wakeup (for shutdown check)
                 {
                     std::unique_lock<std::mutex> lk(key_cv_mtx);
                     key_cv.wait_for(lk, std::chrono::milliseconds(200), [&]() {
@@ -861,18 +865,47 @@ int main(int argc, char *argv[])
 
                 if (long_press_requested.exchange(false)) {
                     if (ble) {
-                        fprintf(stderr, "[keyctl] Long press -> BLE unbind + rescan\n");
+                        fprintf(stderr, "[keyctl] Long press -> BLE unbind + enter pairing\n");
                         ble->reset_pairing_and_rescan();
-                        // 解绑确认：使用三连响提示，与“双方已连接”的长响区分开
-                        audio.play(AudioPlayer::Sound::BLE_PAIR_BOTH);
+                        ble->enter_pairing_mode();
+                        // Audio is handled by enter_pairing_mode -> update_pairing_audio
                     } else {
                         audio.play(AudioPlayer::Sound::REC_ERROR);
                     }
                 }
 
                 if (short_press_requested.exchange(false)) {
+                    if (ble && ble->is_pairing_mode()) {
+                        fprintf(stderr, "[keyctl] Short press -> exit pairing mode\n");
+                        ble->finalize_pairing();
+                        continue;  // skip recording and all other actions
+                    }
+
+                    bool was_recording = recorder.is_recording();
+                    bool now_recording = was_recording;
+
                     if (cfg.recording.enabled) {
-                        recorder.toggle_recording();
+                        now_recording = recorder.toggle_recording();
+                    }
+
+                    if (ble) {
+                        // BLE command is determined by actual local result:
+                        //  - was recording -> always STOP
+                        //  - was not recording -> START only if local succeeded, else STOP
+                        RecordCommand ble_cmd;
+                        if (was_recording) {
+                            ble_cmd = RecordCommand::STOP;
+                        } else {
+                            ble_cmd = now_recording ? RecordCommand::START : RecordCommand::STOP;
+                        }
+
+                        const char *action = (ble_cmd == RecordCommand::START) ? "START" : "STOP";
+                        fprintf(stderr,
+                                "[keyctl] Short press -> local %s->%s, send BLE %s\n",
+                                was_recording ? "REC" : "IDLE",
+                                now_recording ? "REC" : "IDLE",
+                                action);
+                        ble->send_record_command(ble_cmd);
                     }
                 }
             }

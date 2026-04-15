@@ -19,11 +19,12 @@ public:
         REC_STOP,        // descending beep: recording stopped
         REC_ERROR,       // error: failed to start recording (e.g. no SD card)
         BLE_PAIR_ENTER,  // rapid double beep: pairing mode entered
-        BLE_PAIR_ONE,    // double beep: one hand ready
-        BLE_PAIR_BOTH,   // triple beep: both hands ready
+        BLE_PAIR_EXIT,   // descending tone: pairing mode exited
+        BLE_PAIR_ONE,    // double beep: one device not yet connected
+        BLE_PAIR_BOTH,   // triple beep: multiple devices not yet connected
         BLE_CONN_ZERO,   // periodic double beep: 0 BLE IMU connected
         BLE_CONN_ONE,    // periodic single beep: 1 BLE IMU connected
-        BLE_CONN_BOTH,   // one-shot long beep: both BLE IMUs connected
+        BLE_CONN_BOTH,   // one-shot long beep: all BLE IMUs connected
         IMU_DISCONNECT,  // urgent warning: serial IMU lost / open failed
     };
 

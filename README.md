@@ -80,33 +80,38 @@
 | I2C `/dev/i2c-3` | `imu_reader.h` | ICM-42688-P（或 LSM6DS3） | 5560 |
 | BLE `ESP32S3-L` | `ble_imu_manager.h` | BLE IMU（左手） | 5561 |
 | BLE `ESP32S3-R` | `ble_imu_manager.h` | BLE IMU（右手） | 5562 |
+| BLE `RK3588-W` | `ble_imu_manager.h` | BLE IMU（腰部） | 5563 |
 | UART `/dev/ttyS4` | `serial_imu_reader.h` | 串口 IMU（兼容旧模式） | 5561 |
 | UART `/dev/ttyS10` | `serial_imu_reader.h` | 串口 IMU（兼容旧模式） | 5562 |
 
-BLE 模式下，左右手 IMU 复用原来的 `imu_left` / `imu_right` ZMQ 端口与 EuRoC 录制目录，因此下游查看器和录制格式无需修改。ESP32 的 `timestamp_rk_ms` 会被换算成 `timestamp_ns`，并统一对齐到 RK 侧 `CLOCK_MONOTONIC` 时间线。
+BLE 模式下，左右手 IMU 复用原来的 `imu_left` / `imu_right` ZMQ 端口与 EuRoC 录制目录，腰部 IMU（RK3588-W）使用端口 5563。ESP32 和 RK3588 的 `timestamp_rk_ms` 会被换算成 `timestamp_ns`，并统一对齐到 RK3576 侧 `CLOCK_MONOTONIC` 时间线。
 
 BLE 连接与配对行为（RK3576 端实际实现）：
+- 同时搜索三种目标设备：`ESP32S3-L`（左手）、`ESP32S3-R`（右手）、`RK3588-W`（腰部）。
 - 启动时，只要 `ble_imus.enabled: true` 且 DBus 初始化成功，程序会：
-  - 通过 `GetManagedObjects` 枚举 BlueZ 已知设备，识别 `ESP32S3-L` / `ESP32S3-R`；
+  - 通过 `GetManagedObjects` 枚举 BlueZ 已知设备，识别上述三种目标设备名；
   - 调用 `Adapter1.StartDiscovery` 持续扫描；
-  - 若 `ble_imus.paired_left_addr` 和 `paired_right_addr` 已写入，则仅接受 MAC 匹配的左右手设备（Auto-resume 模式）。
-- 每只 ESP32 对应一个内部状态机：
+  - 若 `ble_imus` 中任意 `paired_*_addr` 已写入，则仅接受 MAC 匹配的设备（Auto-resume 模式）。未保存地址的角色在 Auto-resume 模式下不会自动连接。
+- 每台 BLE 设备对应一个内部状态机：
   - `WAIT_ADV` → `CONNECTING` → `DISCOVERING` → `SYNCING` → `STREAMING` → `RECONNECTING`。
-  - 每次 `Connect` 前会临时关闭扫描（`StopDiscovery`），避免“边扫边连”导致控制器/BlueZ 抖动；Connect 结束后再恢复扫描。
-  - 若 `Connect` 返回 `org.bluez.Error.Failed: Operation already in progress`，说明 BlueZ 认为该设备仍有上一轮连接尝试在进行中，此时会先调用 `Device1.CancelConnect` 显式取消本次连接，再在短延时（1s）后重试，避免长时间卡在“连接进行中”的状态。
-  - 若 `Connect` 超时（`Timeout was reached`），会调用 `Adapter1.RemoveDevice(obj_path)` 将该设备从 BlueZ 中移除，并从本地设备表删除，重新扫描等待新的 Device1 对象（避免陷入半连接状态）。
-  - 若 BlueZ 报 `UnknownObject`，说明 Device1 已经被移除，同样只删除本地设备条目，等待重新发现。
-  - 为防止启动早期 BlueZ 尚未完全就绪时漏掉设备，watchdog 线程在发现 `devs_` 为空时，会每隔 5 秒补跑一次 `GetManagedObjects`，直到至少发现一台 ESP32 设备；扫描标志 `scan_active_` 也会在 `StartDiscovery` 报 `InProgress` 时被置为已启动。
-  - 连接成功后会完成 GATT 发现、TimeSync Ping/Pong 同步、下发 `SetOffset`，并启用 IMU Notify，将 BLE IMU 数据转发到 5561/5562。
-- 时间同步采用简化 NTP 策略：每轮发送多次 Ping，丢弃 RTT 过大样本，从 RTT 最小的若干样本中取 offset 中位数，下发给 ESP32；后台每 10 秒对 STREAMING 设备做一次重同步，更新 offset 而不中断数据流。
+  - 连接优先级：RIGHT → LEFT → WAIST，避免多台设备并发 Connect。
+  - 每次 `Connect` 前会临时关闭扫描（`StopDiscovery`），避免”边扫边连”导致控制器/BlueZ 抖动；Connect 结束后再恢复扫描。
+  - 若 `Connect` 返回 `org.bluez.Error.Failed: Operation already in progress`，会先调用 `Device1.CancelConnect` 显式取消，再在 1s 后重试。
+  - 若 `Connect` 超时（`Timeout was reached`），会调用 `Adapter1.RemoveDevice(obj_path)` 强制清理，等待重新发现。
+  - 若 BlueZ 报 `UnknownObject`，说明 Device1 已被移除，等待重新发现。
+  - 连接成功后，通过 `hcitool lecup` 收紧 LE 连接参数至 7.5ms interval，然后完成 GATT 发现、TimeSync Ping/Pong 同步、下发 `SetOffset`，并启用 IMU Notify。
+  - WAIST 角色（RK3588-W）由设备名决定，不受 Config 特征字节覆盖。
+- 时间同步采用简化 NTP 策略：每轮发送 7 次 Ping，丢弃 RTT > 100ms 的样本，从 RTT 最小的 3 个样本中取 offset 中位数，下发给对端；后台每 10 秒对所有 STREAMING 设备做一次重同步。
+- 录制命令转发：短按按键时，除了本地录制切换外，还会向已连接的 WAIST 设备（RK3588-W）发送 BLE 录制 START/STOP 命令（opcode 0x10/0x11），使远端同步开始/停止录制。远端录制状态独立于本地 SD 卡状态维护。
 
 BLE 配对持久化与解绑：
-- 当左右手都进入 STREAMING 且当前还未写入 `paired_left_addr` / `paired_right_addr` 时，程序会自动将实际的左右手 MAC 保存到 `config.json` 中，用于下次启动的自动回连。
-- 板载按键的长按（时长由 `ble_imus.pair_long_press_ms` 控制，默认 1200ms）用于“解绑 + 重新扫描”：
-  - 清空运行时配置中的 `paired_left_addr` / `paired_right_addr` 并持久化；
+- 当所有配置的设备都进入 STREAMING 且当前还未保存配对地址时，程序会自动将已连接设备的 MAC 保存到 `config.json`。
+- 板载按键的**长按**（时长由 `ble_imus.pair_long_press_ms` 控制，默认 1200ms）用于”解绑 + 重新扫描 + 进入配对模式”：
+  - 清空运行时配置中的 `paired_left_addr` / `paired_right_addr` / `paired_waist_addr` 并持久化；
   - 断开所有当前 BLE 连接、取消订阅 notify、重置内部设备表和 BLE 输出槽；
   - 确保 BLE 扫描重新开启，重新枚举 BlueZ 已知设备；
-  - 播放高音三连响作为解绑确认提示。
+  - 进入配对模式，播放高音三连响作为解绑确认提示。
+- 配对模式下的**短按** = 确认保存当前已配对的设备。无需等待所有 3 个设备全部连接，只要有至少 1 个设备已连接即可保存。例如，如果只需要与腰部 RK3588-W 配对，长按后等待 RK3588-W 连接成功，再短按即可仅保存该设备的 MAC。
 
 串口 IMU 使用 31 字节二进制帧协议（含校验和），波特率最高支持 921600；当 `ble_imus.enabled: false` 时仍按旧逻辑工作。
 
@@ -131,14 +136,15 @@ BLE 配对持久化与解绑：
 #### 按键与音频
 
 - **KeyMonitor**（`key_monitor.h`）：监听 Linux input 事件设备，自动识别 ADC 按键（`adc-keys`），支持短按/长按区分。
-  - 短按：默认用于录制切换。
-  - 长按（BLE 模式启用时）：清空 BLE 配对（左右手 MAC）、断开当前连接并重新扫描，扬声器播放高音三连响作为解绑确认。
+  - 短按（正常模式）：本地录制切换 + 向 BLE 腰部设备发送 START/STOP 录制命令。
+  - 短按（配对模式）：确认保存当前已配对的设备，退出配对模式。
+  - 长按（BLE 模式启用时）：清空 BLE 配对（左手/右手/腰部 MAC）、断开当前连接、重新扫描并进入配对模式，扬声器播放高音三连响作为解绑确认。
 - **AudioPlayer**（`audio_player.h`）：基于 ALSA PCM 合成音效，支持 BOOT、REC\_START/STOP、REC\_BEEP、REC\_ERROR、BLE 连接状态提示和 `IMU_DISCONNECT` 告警。
 
-BLE 连接数量对应的提示音（由 `BleImuManager::update_connection_audio` 控制）：
-- 0 只 BLE IMU 连接：每 2 秒播放一次双响（约 900 Hz，短双 beep），提示“还未连接任何 BLE IMU”。
-- 1 只 BLE IMU 连接：每 2 秒播放一次单响（约 1100 Hz），提示“仅有一只手已连接”。
-- 2 只 BLE IMU 连接：停止周期提示，播放一次单次长响（约 900 Hz，0.8 秒），提示“两只手都已连接且 IMU 数据正常推流”，并在首次达到该状态时自动持久化当前左右手 MAC。
+BLE 连接数量对应的提示音（由 `BleImuManager::update_connection_audio` 控制，采用 `beep_count = expected - ready` 策略）：
+- 还差 ≥2 个设备未连接：每 2 秒播放一次双响（约 900 Hz，短双 beep）。
+- 还差 1 个设备未连接：每 2 秒播放一次单响（约 1100 Hz）。
+- 所有设备都已连接：停止周期提示，播放一次单次长响（约 900 Hz，0.8 秒），并在首次达到该状态时自动持久化当前配对 MAC。
 
 #### 运行时参数控制（`param_controller.h`）
 
@@ -307,11 +313,13 @@ cd app/quad_cam_streamer
     "disconnect_timeout_ms": 2000,
     "disconnect_alarm_interval_ms": 5000,
     "paired_left_addr": "",
-    "paired_right_addr": ""
+    "paired_right_addr": "",
+    "paired_waist_addr": ""
   },
   "serial_imus": [
     {"enabled": true, "name": "imu_left",  "role": "left",  "uart_device": "/dev/ttyS4",  "baudrate": 921600, "zmq_port": 5561},
-    {"enabled": true, "name": "imu_right", "role": "right", "uart_device": "/dev/ttyS10", "baudrate": 921600, "zmq_port": 5562}
+    {"enabled": true, "name": "imu_right", "role": "right", "uart_device": "/dev/ttyS10", "baudrate": 921600, "zmq_port": 5562},
+    {"enabled": true, "name": "imu_waist", "role": "waist", "uart_device": "/dev/ttyS0",  "baudrate": 921600, "zmq_port": 5563}
   ],
   "recording": {
     "enabled": true,
@@ -343,13 +351,14 @@ cd app/quad_cam_streamer
 | `cameras[].auto_exposure` | 启用软件自动曝光 |
 | `cameras[].use_rkaiq` | 启用 Rockchip ISP 3A（与 auto_exposure 二选一） |
 | `imu.rotation_matrix` | 传感器→机体坐标系 3×3 旋转矩阵 |
-| `ble_imus.enabled` | 启用 BLE 双手 IMU，替代串口读取路径 |
-| `ble_imus.auto_resume` | 若已保存左右手地址，启动后自动回连 |
+| `ble_imus.enabled` | 启用 BLE IMU（左手/右手/腰部），替代串口读取路径 |
+| `ble_imus.auto_resume` | 若已保存任意设备地址，启动后自动回连 |
 | `ble_imus.pair_long_press_ms` | 进入 BLE 配对模式所需长按时长 |
 | `ble_imus.disconnect_timeout_ms` | BLE IMU 超时判定阈值 |
-| `ble_imus.paired_left_addr` | 首次成功配对后自动写入的左手 BLE 地址 |
-| `ble_imus.paired_right_addr` | 首次成功配对后自动写入的右手 BLE 地址 |
-| `serial_imus[].role` | BLE 模式下声明该输出槽位对应左手或右手 |
+| `ble_imus.paired_left_addr` | 配对后自动写入的左手 BLE 地址 |
+| `ble_imus.paired_right_addr` | 配对后自动写入的右手 BLE 地址 |
+| `ble_imus.paired_waist_addr` | 配对后自动写入的腰部 BLE 地址（RK3588-W） |
+| `serial_imus[].role` | BLE 模式下声明该输出槽位对应 left / right / waist |
 | `recording.output_format` | `"image"`（JPEG 文件）或 `"video"`（AVI 容器） |
 | `recording.video_codec` | `"mjpeg"`（直接透传）或 `"h264"`（转码，需 FFmpeg） |
 | `recording.record_key_code` | 触发录制的 Linux input 按键码（115 = KEY_VOLUMEDOWN） |
@@ -368,6 +377,7 @@ cd app/quad_cam_streamer
 | I2C IMU | 5560 | ZMQ PUB，IMU 数据 |
 | 左手 IMU（BLE 或串口） | 5561 | ZMQ PUB，IMU 数据 |
 | 右手 IMU（BLE 或串口） | 5562 | ZMQ PUB，IMU 数据 |
+| 腰部 IMU（BLE 或串口） | 5563 | ZMQ PUB，IMU 数据（RK3588-W） |
 | 参数控制服务 | 5570 | ZMQ REP，JSON 命令接口 |
 
 ---
@@ -391,10 +401,13 @@ cd app/quad_cam_streamer
 ├── imu0/                    # I2C IMU
 │   ├── sensor.yaml
 │   └── data.csv
-├── imu1/                    # 串口 IMU（左）
+├── imu1/                    # 串口/BLE IMU（左）
 │   ├── sensor.yaml
 │   └── data.csv
-└── imu2/                    # 串口 IMU（右）
+├── imu2/                    # 串口/BLE IMU（右）
+│   ├── sensor.yaml
+│   └── data.csv
+└── imu3/                    # BLE IMU（腰部，RK3588-W）
     ├── sensor.yaml
     └── data.csv
 ```

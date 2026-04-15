@@ -25,6 +25,13 @@ enum class BleHandRole {
     UNKNOWN,
     RIGHT,
     LEFT,
+    WAIST,
+};
+
+// Record control commands forwarded to the BLE peer (e.g. RK3588-W).
+enum class RecordCommand {
+    START,
+    STOP,
 };
 
 struct BleImuOutputConfig {
@@ -62,8 +69,12 @@ public:
     void dispatch_imu(const std::string &addr, GVariant *params);
 
     // Reset stored BLE pairing (MAC addresses) and restart scan.
-    // Intended to be called from the key handler on triple-press.
+    // Intended to be called from the key handler on long-press.
     void reset_pairing_and_rescan();
+
+    // Forward local recording state changes to the BLE peer. No-op if there is
+    // no active STREAMING device or BLE is not running.
+    void send_record_command(RecordCommand cmd);
 
 private:
     struct CharHandles {
@@ -158,6 +169,10 @@ private:
                     bool with_response = true);
     bool enable_notify(const std::string &path);
 
+    // Best-effort request to tighten LE connection parameters for a given
+    // device by calling `hcitool lecup` on RK3576. Failures are non-fatal.
+    void request_fast_conn_params(const BleDevice &dev);
+
     void watchdog_loop();
     void resync_loop();
 
@@ -170,10 +185,12 @@ private:
     uint64_t expand_timestamp_ms(OutputChannel &out, uint32_t timestamp_ms32);
     void launch_worker(std::function<void()> fn);
     bool has_saved_pairing() const;
+    int saved_device_count() const;
     std::string configured_addr_for(BleHandRole hand) const;
     BleHandRole role_from_configured_addr(const std::string &addr) const;
     bool persist_current_pairing();
-    bool collect_paired_addresses(std::string &left_addr, std::string &right_addr) const;
+    bool collect_paired_addresses(std::string &left_addr, std::string &right_addr,
+                                  std::string &waist_addr) const;
 
     BleImuConfig cfg_;
     std::string config_path_;

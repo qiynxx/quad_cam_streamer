@@ -125,6 +125,7 @@ AppConfig load_config(const std::string &path)
         if (b.contains("disconnect_alarm_interval_ms")) cfg.ble_imus.disconnect_alarm_interval_ms = b["disconnect_alarm_interval_ms"];
         if (b.contains("paired_left_addr"))           cfg.ble_imus.paired_left_addr = b["paired_left_addr"].get<std::string>();
         if (b.contains("paired_right_addr"))          cfg.ble_imus.paired_right_addr = b["paired_right_addr"].get<std::string>();
+        if (b.contains("paired_waist_addr"))          cfg.ble_imus.paired_waist_addr = b["paired_waist_addr"].get<std::string>();
     }
 
     if (j.contains("recording")) {
@@ -195,6 +196,7 @@ bool persist_ble_pairing_config(const std::string &path,
     b["disconnect_alarm_interval_ms"] = ble_cfg.disconnect_alarm_interval_ms;
     b["paired_left_addr"] = ble_cfg.paired_left_addr;
     b["paired_right_addr"] = ble_cfg.paired_right_addr;
+    b["paired_waist_addr"] = ble_cfg.paired_waist_addr;
 
     return write_json_atomic(path, j, error);
 }

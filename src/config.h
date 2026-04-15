@@ -53,12 +53,13 @@ struct SerialImuConfig {
 struct BleImuConfig {
     bool enabled = false;
     bool auto_resume = true;
-    int pair_long_press_ms = 1200;
+    int pair_long_press_ms = 3000;
     int pairing_status_interval_ms = 2500;
     int disconnect_timeout_ms = 2000;
     int disconnect_alarm_interval_ms = 5000;
     std::string paired_left_addr;
     std::string paired_right_addr;
+    std::string paired_waist_addr;
 };
 
 struct RecordingConfig {
