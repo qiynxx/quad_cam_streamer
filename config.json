@@ -21,7 +21,7 @@
       "analogue_gain": 16,
       "ae_target_brightness": 100,
       "ae_max_analogue_gain": 96,
-      "use_rkaiq": true,
+      "use_rkaiq": false,
       "sensor_entity_name": "m01_b_imx334 5-0036",
       "iq_file_dir": "/etc/iqfiles"
     },
@@ -41,13 +41,13 @@
       "analogue_gain": 16,
       "ae_target_brightness": 100,
       "ae_max_analogue_gain": 96,
-      "use_rkaiq": true,
+      "use_rkaiq": false,
       "sensor_entity_name": "m00_b_imx334 4-001a",
       "iq_file_dir": "/etc/iqfiles"
     },
     {
       "name": "m02_b_ov9281 8-0060",
-      "enabled": false,
+      "enabled": true,
       "device": "/dev/video62",
       "subdev": "/dev/v4l-subdev13",
       "width": 1280,
@@ -65,7 +65,7 @@
     },
     {
       "name": "m03_b_ov9281 9-0060",
-      "enabled": false,
+      "enabled": true,
       "device": "/dev/video71",
       "subdev": "/dev/v4l-subdev18",
       "width": 1280,
@@ -141,7 +141,8 @@
     "input_device": "",
     "output_format": "image",
     "video_codec": "mjpeg",
-    "video_bitrate_mbps": 10
+    "video_bitrate_mbps": 10,
+    "key_event_port": 5565
   },
   "hardware_sync": {
     "enabled": true,

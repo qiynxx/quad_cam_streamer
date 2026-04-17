@@ -829,6 +829,19 @@ int main(int argc, char *argv[])
     std::mutex key_cv_mtx;
     std::condition_variable key_cv;
 
+    // ZMQ publisher for key events (START/STOP) so zmq_viewer can display state.
+    // Message format: [uint64_t timestamp_ns (8B LE)][uint8_t is_recording (1B)]
+    ZmqStreamer key_event_zmq;
+    if (cfg.recording.key_event_port > 0) {
+        if (key_event_zmq.bind(cfg.recording.key_event_port, 2)) {
+            fprintf(stderr, "Key event ZMQ bound on port %d\n",
+                    cfg.recording.key_event_port);
+        } else {
+            fprintf(stderr, "WARNING: failed to bind key event ZMQ on port %d\n",
+                    cfg.recording.key_event_port);
+        }
+    }
+
     if (cfg.recording.enabled || cfg.ble_imus.enabled) {
         threads.emplace_back([&cfg, &short_press_requested, &long_press_requested,
                               &key_cv]() {
@@ -849,7 +862,7 @@ int main(int argc, char *argv[])
 
         threads.emplace_back([&cfg, &recorder, &audio, &short_press_requested,
                               &long_press_requested, &key_cv, &key_cv_mtx,
-                              ble = ble_imu.get()]() {
+                              ble = ble_imu.get(), &key_event_zmq]() {
             fprintf(stderr, "[keyctl] Handler thread started\n");
 
             while (g_running.load()) {
@@ -888,24 +901,42 @@ int main(int argc, char *argv[])
                         now_recording = recorder.toggle_recording();
                     }
 
-                    if (ble) {
-                        // BLE command is determined by actual local result:
-                        //  - was recording -> always STOP
-                        //  - was not recording -> START only if local succeeded, else STOP
-                        RecordCommand ble_cmd;
-                        if (was_recording) {
-                            ble_cmd = RecordCommand::STOP;
-                        } else {
-                            ble_cmd = now_recording ? RecordCommand::START : RecordCommand::STOP;
-                        }
+                    // Capture timestamp ONCE for both BLE and ZMQ so they match.
+                    struct timespec ts_now;
+                    clock_gettime(CLOCK_MONOTONIC, &ts_now);
+                    uint64_t ts_ns = (uint64_t)ts_now.tv_sec * 1000000000ULL
+                                     + (uint64_t)ts_now.tv_nsec;
 
-                        const char *action = (ble_cmd == RecordCommand::START) ? "START" : "STOP";
+                    // Determine command: START or STOP
+                    bool is_start;
+                    if (was_recording) {
+                        is_start = false;  // was recording -> STOP
+                    } else {
+                        is_start = now_recording;  // START only if local succeeded
+                    }
+
+                    // Publish key event on ZMQ (same timestamp for BLE and viewer)
+                    {
+                        uint8_t msg[9];
+                        memcpy(msg, &ts_ns, 8);
+                        msg[8] = is_start ? 1 : 0;
+                        key_event_zmq.send(msg, sizeof(msg));
+                        fprintf(stderr, "[keyctl] Published key event on ZMQ: %s ts=%lu\n",
+                                is_start ? "START" : "STOP",
+                                (unsigned long)ts_ns);
+                    }
+
+                    if (ble) {
+                        RecordCommand ble_cmd = is_start ? RecordCommand::START
+                                                         : RecordCommand::STOP;
+                        const char *action = is_start ? "START" : "STOP";
                         fprintf(stderr,
                                 "[keyctl] Short press -> local %s->%s, send BLE %s\n",
                                 was_recording ? "REC" : "IDLE",
                                 now_recording ? "REC" : "IDLE",
                                 action);
-                        ble->send_record_command(ble_cmd);
+                        uint32_t ts_ms = (uint32_t)((ts_ns / 1000000ULL) & 0xffffffffu);
+                        ble->send_record_command(ble_cmd, ts_ms);
                     }
                 }
             }

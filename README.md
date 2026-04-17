@@ -202,8 +202,12 @@ app/quad_cam_streamer/
 │   ├── pwm_sync.h / .cpp          # PWM FSIN 多相机硬件同步
 │   └── param_controller.h / .cpp  # 运行时参数更新（ZMQ REP，端口 5570）
 └── tools/
-    ├── zmq_viewer.py              # Python ZMQ MJPEG 接收与显示
-    └── requirements.txt
+    ├── zmq_viewer/
+    │   ├── zmq_viewer.py          # Python ZMQ MJPEG + IMU 接收与显示
+    │   ├── config.json            # 查看端配置
+    │   └── requirements.txt
+    ├── key_event_receiver.py      # 按键事件 ZMQ 接收工具（独立脚本）
+    └── quad_calibration/          # 多目标定工具
 ```
 
 ---
@@ -329,7 +333,8 @@ cd app/quad_cam_streamer
     "input_device": "",
     "output_format": "image",
     "video_codec": "mjpeg",
-    "video_bitrate_mbps": 10
+    "video_bitrate_mbps": 10,
+    "key_event_port": 5565
   },
   "hardware_sync": {
     "enabled": true,
@@ -362,6 +367,7 @@ cd app/quad_cam_streamer
 | `recording.output_format` | `"image"`（JPEG 文件）或 `"video"`（AVI 容器） |
 | `recording.video_codec` | `"mjpeg"`（直接透传）或 `"h264"`（转码，需 FFmpeg） |
 | `recording.record_key_code` | 触发录制的 Linux input 按键码（115 = KEY_VOLUMEDOWN） |
+| `recording.key_event_port` | 按键事件 ZMQ PUB 端口（默认 5565），设为 0 禁用 |
 | `hardware_sync.enabled` | 启用 PWM FSIN 多相机帧同步 |
 
 ---
@@ -378,6 +384,7 @@ cd app/quad_cam_streamer
 | 左手 IMU（BLE 或串口） | 5561 | ZMQ PUB，IMU 数据 |
 | 右手 IMU（BLE 或串口） | 5562 | ZMQ PUB，IMU 数据 |
 | 腰部 IMU（BLE 或串口） | 5563 | ZMQ PUB，IMU 数据（RK3588-W） |
+| 按键事件 | 5565 | ZMQ PUB，录制 START/STOP 按键事件 |
 | 参数控制服务 | 5570 | ZMQ REP，JSON 命令接口 |
 
 ---
@@ -432,6 +439,64 @@ cd app/quad_cam_streamer
 
 ---
 
+## ZMQ 消息格式
+
+所有 ZMQ 消息均通过 PUB socket 发布，订阅端使用 SUB socket 连接对应端口，`subscribe = ""`（接收全部消息）。所有时间戳均为 `CLOCK_MONOTONIC` 纳秒，小端序（little-endian）。
+
+### 相机帧（端口 5550–5553）
+
+每条消息 = 一帧 JPEG 图像，前 8 字节为时间戳。
+
+| 偏移 | 长度 | 类型 | 说明 |
+|------|------|------|------|
+| 0 | 8 | `uint64_t` LE | 帧捕获时间戳（纳秒，CLOCK_MONOTONIC） |
+| 8 | 可变 | `bytes` | JPEG 编码数据 |
+
+### IMU 数据（端口 5560–5563）
+
+每条消息固定 56 字节。
+
+| 偏移 | 长度 | 类型 | 说明 |
+|------|------|------|------|
+| 0 | 8 | `uint64_t` LE | 采样时间戳（纳秒，CLOCK_MONOTONIC） |
+| 8 | 8 | `double` LE | 加速度 X（m/s²） |
+| 16 | 8 | `double` LE | 加速度 Y（m/s²） |
+| 24 | 8 | `double` LE | 加速度 Z（m/s²） |
+| 32 | 8 | `double` LE | 角速度 X（rad/s） |
+| 40 | 8 | `double` LE | 角速度 Y（rad/s） |
+| 48 | 8 | `double` LE | 角速度 Z（rad/s） |
+
+Python 解包示例：
+```python
+import struct
+ts_ns, ax, ay, az, gx, gy, gz = struct.unpack("<Qdddddd", data)
+```
+
+### 按键事件（端口 5565）
+
+按下板载按键切换录制状态时发布一条消息，固定 9 字节。该消息与 BLE 录制命令使用**同一时间戳**（在同一次 `clock_gettime` 调用中获取），保证 ZMQ 订阅端和 BLE 远端看到的时间戳完全一致。
+
+| 偏移 | 长度 | 类型 | 说明 |
+|------|------|------|------|
+| 0 | 8 | `uint64_t` LE | 按键时间戳（纳秒，CLOCK_MONOTONIC） |
+| 8 | 1 | `uint8_t` | 录制状态：`1` = 开始录制（START），`0` = 停止录制（STOP） |
+
+Python 解包示例：
+```python
+import struct
+ts_ns = struct.unpack("<Q", data[:8])[0]
+is_recording = data[8] != 0
+```
+
+触发时机：
+- 短按按键且当前未处于 BLE 配对模式时触发。
+- 录制启用时，先执行本地录制切换，再根据结果发布 START 或 STOP。
+- BLE 启用时，同一时间戳会通过 BLE GATT Write 发送 opcode `0x10`（START）或 `0x11`（STOP）至腰部设备。
+
+配置项：`recording.key_event_port`（默认 `5565`），设为 `0` 可禁用。
+
+---
+
 ## 使用
 
 ### 板端
@@ -464,6 +529,25 @@ pip install -r requirements.txt
 python3 zmq_viewer.py --host <board_ip>           # 4路独立窗口
 python3 zmq_viewer.py --host <board_ip> --grid    # 2×2 网格
 python3 zmq_viewer.py --host <board_ip> --cameras 0,1  # 仅查看指定路
+```
+
+### PC 端监听按键事件
+
+```bash
+cd app/quad_cam_streamer/tools
+python3 key_event_receiver.py --host <board_ip>           # 监听录制按键状态
+python3 key_event_receiver.py --host <board_ip> --port 5565  # 指定端口
+```
+
+输出示例：
+```
+Listening for key events on tcp://192.168.100.1:5565
+Waiting for events... (Ctrl+C to quit)
+
+   #  State     Timestamp (ns)    Timestamp (s)
+----  --------  --------------------  ----------------
+   1  START       123456789012345    123456.789012
+   2  STOP        123459012345678    123459.012346
 ```
 
 ### 运行时更新参数

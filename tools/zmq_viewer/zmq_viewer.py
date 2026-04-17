@@ -49,6 +49,7 @@ import zmq
 IMU_MSG_SIZE = 56  # 8 + 24 + 24 bytes
 IMU_STRUCT_FMT = "<Qdddddd"  # uint64 + 6 doubles
 FRAME_BUF_SIZE = 15  # ~500ms at 30fps, enough for network jitter
+KEY_EVENT_MSG_SIZE = 9  # 8 (uint64 timestamp_ns) + 1 (uint8 is_recording)
 
 
 def load_config():
@@ -151,6 +152,72 @@ class ImuReceiver:
             if not self.buffer:
                 return None
             return min(self.buffer, key=lambda x: abs(x[0] - target_ts_ns))
+
+
+class KeyEventReceiver:
+    """Background thread that receives key press events (START/STOP) via ZMQ.
+
+    Message format: [uint64_t timestamp_ns (8B LE)][uint8_t is_recording (1B)]
+    """
+
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.lock = threading.Lock()
+        self.is_recording = False
+        self.last_ts_ns = 0
+        self.event_count = 0
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def _run(self):
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.RCVHWM, 10)
+        sock.setsockopt(zmq.SUBSCRIBE, b"")
+        addr = f"tcp://{self.host}:{self.port}"
+        sock.connect(addr)
+        print(f"  Key event -> {addr}")
+
+        poller = zmq.Poller()
+        poller.register(sock, zmq.POLLIN)
+
+        while self._running:
+            events = dict(poller.poll(timeout=100))
+            if sock not in events:
+                continue
+
+            try:
+                data = sock.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                continue
+
+            if len(data) != KEY_EVENT_MSG_SIZE:
+                continue
+
+            ts_ns = struct.unpack("<Q", data[:8])[0]
+            is_rec = data[8] != 0
+
+            with self.lock:
+                self.is_recording = is_rec
+                self.last_ts_ns = ts_ns
+                self.event_count += 1
+
+        sock.close()
+        ctx.term()
+
+    def get_state(self):
+        """Returns (is_recording, timestamp_ns, event_count)."""
+        with self.lock:
+            return self.is_recording, self.last_ts_ns, self.event_count
 
 
 class ParamController:
@@ -431,6 +498,7 @@ def main():
     default_imu_port = cfg.get("imu_port", 5560)
     default_imu_left_port = cfg.get("imu_left_port", 5561)
     default_imu_right_port = cfg.get("imu_right_port", 5562)
+    default_key_event_port = cfg.get("key_event_port", 5565)
     cam_configs = cfg.get("cameras", [])
 
     parser = argparse.ArgumentParser(description="ZMQ MJPEG + IMU Viewer")
@@ -456,6 +524,10 @@ def main():
                         help=f"左手 IMU ZMQ 端口 (默认 config 或 {default_imu_left_port})")
     parser.add_argument("--imu-right-port", type=int, default=None,
                         help=f"右手 IMU ZMQ 端口 (默认 config 或 {default_imu_right_port})")
+    parser.add_argument("--key-event-port", type=int, default=default_key_event_port,
+                        help=f"Key event ZMQ port (default: {default_key_event_port})")
+    parser.add_argument("--no-key-event", action="store_true",
+                        help="Disable key event (recording state) display")
     args = parser.parse_args()
 
     if args.hands_only:
@@ -641,6 +713,13 @@ def main():
     if show_imu:
         imu_recv = ImuReceiver(args.host, args.imu_port)
         imu_recv.start()
+
+    # Start key event receiver
+    show_key_event = not args.no_key_event
+    key_event_recv = None
+    if show_key_event:
+        key_event_recv = KeyEventReceiver(args.host, args.key_event_port)
+        key_event_recv.start()
 
     # Connect camera ZMQ sockets (no CONFLATE - we need frame buffering)
     context = zmq.Context()
@@ -890,6 +969,30 @@ def main():
                                 (10, imu_y0 + 35),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (100, 100, 100), 1)
 
+            # Draw recording state indicator (top-center)
+            if key_event_recv:
+                is_rec, rec_ts_ns, rec_count = key_event_recv.get_state()
+                if rec_count > 0:
+                    if is_rec:
+                        rec_text = "REC"
+                        rec_color = (0, 0, 255)  # Red
+                        rec_bg = (0, 0, 180)
+                    else:
+                        rec_text = "IDLE"
+                        rec_color = (200, 200, 200)
+                        rec_bg = (80, 80, 80)
+                    ts_text = f"ts:{rec_ts_ns/1e9:.3f}s"
+                    full_text = f"{rec_text}  {ts_text}"
+                    text_size = cv2.getTextSize(full_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+                    tx = (win_w - text_size[0]) // 2
+                    # Background rectangle
+                    cv2.rectangle(grid, (tx - 8, 4), (tx + text_size[0] + 8, 34), rec_bg, -1)
+                    cv2.putText(grid, full_text, (tx, 28),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    # Blinking red dot for REC
+                    if is_rec:
+                        cv2.circle(grid, (tx - 16, 20), 8, (0, 0, 255), -1)
+
             # Draw sync status at top-right
             if len(disp_cam_ts) > 1:
                 sync_color = (0, 255, 0) if match_diff_ms < 2.0 else (0, 180, 255)
@@ -932,7 +1035,12 @@ def main():
                     _, rate = imu_recv.get_latest()
                     imu_info = f", IMU: {rate:.0f}Hz"
                 sync_info = f", sync:{match_diff_ms:.2f}ms"
-                print(f"FPS: {fps_str}{imu_info}{sync_info}")
+                rec_info = ""
+                if key_event_recv:
+                    is_rec, _, rec_cnt = key_event_recv.get_state()
+                    if rec_cnt > 0:
+                        rec_info = f", {'REC' if is_rec else 'IDLE'}"
+                print(f"FPS: {fps_str}{imu_info}{sync_info}{rec_info}")
                 for idx in cam_indices:
                     frame_counts[idx] = 0
                 fps_start = time.time()
@@ -1015,6 +1123,8 @@ def main():
     finally:
         if imu_recv:
             imu_recv.stop()
+        if key_event_recv:
+            key_event_recv.stop()
         if param_ctrl:
             param_ctrl.close()
         cv2.destroyAllWindows()

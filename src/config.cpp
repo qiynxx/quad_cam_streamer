@@ -138,6 +138,7 @@ AppConfig load_config(const std::string &path)
         if (r.contains("output_format"))   cfg.recording.output_format = r["output_format"].get<std::string>();
         if (r.contains("video_codec"))     cfg.recording.video_codec = r["video_codec"].get<std::string>();
         if (r.contains("video_bitrate_mbps")) cfg.recording.video_bitrate_mbps = r["video_bitrate_mbps"];
+        if (r.contains("key_event_port"))  cfg.recording.key_event_port = r["key_event_port"];
     }
 
     if (j.contains("hardware_sync")) {

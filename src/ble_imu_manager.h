@@ -74,7 +74,8 @@ public:
 
     // Forward local recording state changes to the BLE peer. No-op if there is
     // no active STREAMING device or BLE is not running.
-    void send_record_command(RecordCommand cmd);
+    // If timestamp_ms is non-zero, use it instead of calling monotonic_ms().
+    void send_record_command(RecordCommand cmd, uint32_t timestamp_ms = 0);
 
 private:
     struct CharHandles {

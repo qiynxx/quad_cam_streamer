@@ -71,6 +71,7 @@ struct RecordingConfig {
     std::string output_format = "video";
     std::string video_codec = "mjpeg";
     int video_bitrate_mbps = 10;
+    int key_event_port = 5565;  // ZMQ PUB port for key press events (START/STOP)
 };
 
 struct HwSyncConfig {

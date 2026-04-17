@@ -1161,7 +1161,7 @@ void BleImuManager::request_fast_conn_params(const BleDevice &dev)
     }
 }
 
-void BleImuManager::send_record_command(RecordCommand cmd)
+void BleImuManager::send_record_command(RecordCommand cmd, uint32_t timestamp_ms)
 {
     if (!running_.load())
         return;
@@ -1180,7 +1180,9 @@ void BleImuManager::send_record_command(RecordCommand cmd)
 
     uint8_t buf[5];
     buf[0] = opcode;
-    pack_u32_le(buf + 1, (uint32_t)(monotonic_ms() & 0xffffffffu));
+    uint32_t ts = timestamp_ms ? timestamp_ms
+                               : (uint32_t)(monotonic_ms() & 0xffffffffu);
+    pack_u32_le(buf + 1, ts);
 
     std::shared_ptr<BleDevice> target;
     {
