@@ -2,10 +2,10 @@
   "host": "192.168.100.1",
   "base_port": 5550,
   "cameras": [
-    { "index": 0, "name": "imx334_0", "enabled": true, "distortion_model": "radtan" },
-    { "index": 1, "name": "imx334_1", "enabled": true, "distortion_model": "radtan" },
-    { "index": 2, "name": "ov9281_0", "enabled": true, "distortion_model": "fisheye" },
-    { "index": 3, "name": "ov9281_1", "enabled": true, "distortion_model": "fisheye" }
+    { "index": 0, "name": "imx334_0", "enabled": true, "distortion_model": "fisheye" },
+    { "index": 1, "name": "imx334_1", "enabled": true, "distortion_model": "fisheye" },
+    { "index": 2, "name": "ov9281_0", "enabled": true, "distortion_model": "auto" },
+    { "index": 3, "name": "ov9281_1", "enabled": true, "distortion_model": "auto" }
   ],
   "board": {
     "type": "chessboard",

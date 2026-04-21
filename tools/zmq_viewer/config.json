@@ -3,7 +3,6 @@
   "base_port": 5550,
   "cell_width": 640,
   "imu_port": 5560,
-  "key_event_port": 5565,
   "cameras": [
     { "index": 0, "name": "imx334_0", "enabled": true },
     { "index": 1, "name": "imx334_1", "enabled": true },

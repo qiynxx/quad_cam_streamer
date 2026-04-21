@@ -21,6 +21,7 @@ Requirements:
 import argparse
 import json
 import os
+import re
 import struct
 import sys
 import time
@@ -55,7 +56,7 @@ DISTORTION_MODELS = {
     "fisheye": {
         "cv_flags": cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC,
         "num_coeffs": 4,          # [k1, k2, k3, k4] (KB4 / equidistant)
-        "euroc_camera": "pinhole",  # still pinhole projection for EuRoC
+        "euroc_camera": "fisheye",
         "euroc_distortion": "equidistant",
         "subpix_window": (5, 5),
     },
@@ -81,6 +82,99 @@ class BoardSpec:
         objp[:, :2] = np.mgrid[0:self.cols, 0:self.rows].T.reshape(-1, 2)
         objp *= self.square_size_mm
         return objp
+
+
+# ---------------------------------------------------------------------------
+# Coverage tracker — guides user to place board across full image area
+# ---------------------------------------------------------------------------
+
+# Grid resolution for coverage tracking (divide image into NxN cells)
+_COVERAGE_GRID = 5
+
+
+class CoverageTracker:
+    """Tracks which image regions have been covered by detected corners.
+
+    Divides the image into a grid and records which cells contain at least
+    one chessboard corner across all saved frames.
+    """
+
+    def __init__(self, grid_n: int = _COVERAGE_GRID):
+        self.grid_n = grid_n
+        # Per-camera coverage: cam_idx -> (grid_n x grid_n) hit count
+        self._hits: Dict[int, np.ndarray] = {}
+
+    def update(self, cam_idx: int, corners: np.ndarray,
+               image_size: Tuple[int, int]):
+        """Record corner positions for one frame."""
+        w, h = image_size
+        n = self.grid_n
+        if cam_idx not in self._hits:
+            self._hits[cam_idx] = np.zeros((n, n), dtype=np.int32)
+
+        pts = corners.reshape(-1, 2)
+        for x, y in pts:
+            ci = int(x / w * n)
+            ri = int(y / h * n)
+            ci = min(ci, n - 1)
+            ri = min(ri, n - 1)
+            self._hits[cam_idx][ri, ci] += 1
+
+    def coverage_fraction(self, cam_idx: int) -> float:
+        """Return fraction of grid cells that have at least one corner."""
+        if cam_idx not in self._hits:
+            return 0.0
+        grid = self._hits[cam_idx]
+        return float(np.count_nonzero(grid)) / grid.size
+
+    def draw_overlay(self, img: np.ndarray, cam_idx: int) -> np.ndarray:
+        """Draw semi-transparent coverage overlay on image.
+
+        Green = covered, Red = uncovered.  Returns a new image.
+        """
+        h, w = img.shape[:2]
+        n = self.grid_n
+        overlay = img.copy()
+
+        grid = self._hits.get(cam_idx, np.zeros((n, n), dtype=np.int32))
+        for ri in range(n):
+            for ci in range(n):
+                x0 = int(ci * w / n)
+                y0 = int(ri * h / n)
+                x1 = int((ci + 1) * w / n)
+                y1 = int((ri + 1) * h / n)
+                if grid[ri, ci] > 0:
+                    color = (0, 80, 0)  # dark green
+                else:
+                    color = (0, 0, 80)  # dark red
+                cv2.rectangle(overlay, (x0, y0), (x1, y1), color, -1)
+
+        # Blend
+        result = cv2.addWeighted(img, 0.7, overlay, 0.3, 0)
+
+        # Draw grid lines
+        for i in range(1, n):
+            x = int(i * w / n)
+            y = int(i * h / n)
+            cv2.line(result, (x, 0), (x, h), (100, 100, 100), 1)
+            cv2.line(result, (0, y), (w, y), (100, 100, 100), 1)
+
+        # Coverage percentage text
+        pct = self.coverage_fraction(cam_idx) * 100
+        color = (0, 255, 0) if pct >= 80 else (0, 255, 255) if pct >= 50 else (0, 0, 255)
+        cv2.putText(result, f"{pct:.0f}%", (w - 55, h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        return result
+
+    def report(self, cam_names: Dict[int, str]) -> str:
+        """Return a summary string of coverage per camera."""
+        lines = []
+        for idx in sorted(self._hits.keys()):
+            pct = self.coverage_fraction(idx) * 100
+            name = cam_names.get(idx, f"cam{idx}")
+            status = "OK" if pct >= 80 else "WARN: add more edge captures" if pct >= 50 else "POOR: edges uncovered!"
+            lines.append(f"  [cam{idx}] {name}: {pct:.0f}% coverage — {status}")
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -241,13 +335,33 @@ def run_capture_mode(cfg: dict, args) -> str:
     print(f"\nCapture preview: {win_w}x{win_h}  (cell {cell_w}x{cell_h})")
     print("Controls:")
     print("  SPACE - Save current frames from all cameras")
+    print("  C     - Toggle coverage overlay (shows which regions need more data)")
     print("  Q     - Quit capture mode")
     print()
 
     latest: Dict[int, np.ndarray] = {}
     detect_cache: Dict[int, Tuple[bool, Optional[np.ndarray]]] = {}
-    frame_idx = 0
+    coverage = CoverageTracker()
+    show_coverage = False
     detect_max_width = 640  # downscale for fast detection
+
+    # Resume from existing captures: find the next available frame index
+    frame_idx = 0
+    for idx in cam_indices:
+        name = cam_names.get(idx, f"cam{idx}")
+        cam_dir = os.path.join(capture_dir, f"cam{idx}_{name}")
+        if os.path.isdir(cam_dir):
+            existing = [f for f in os.listdir(cam_dir)
+                        if f.startswith("frame_") and f.endswith(".png")]
+            for f in existing:
+                try:
+                    num = int(f[6:10])  # frame_NNNN.png
+                    frame_idx = max(frame_idx, num + 1)
+                except ValueError:
+                    pass
+    if frame_idx > 0:
+        print(f"  Resuming from frame set {frame_idx} "
+              f"({frame_idx} existing sets found)")
     window_name = "Quad Calibration - Capture"
 
     try:
@@ -278,6 +392,8 @@ def run_capture_mode(cfg: dict, args) -> str:
 
                     vis = draw_detection(latest[idx], board.pattern_size,
                                          found, corners)
+                    if show_coverage:
+                        vis = coverage.draw_overlay(vis, idx)
                     resized = cv2.resize(vis, (nw, nh))
 
                     px = (cell_w - nw) // 2
@@ -318,11 +434,22 @@ def run_capture_mode(cfg: dict, args) -> str:
                     fname = f"frame_{frame_idx:04d}.png"
                     cv2.imwrite(os.path.join(cam_dir, fname), latest[idx])
                     saved_any = True
+                    # Update coverage with detected corners
+                    det = detect_cache.get(idx, (False, None))
+                    if det[0] and det[1] is not None:
+                        fh, fw = latest[idx].shape[:2]
+                        coverage.update(idx, det[1], (fw, fh))
                 if saved_any:
                     print(f"  Saved frame set {frame_idx}")
                     frame_idx += 1
                 else:
                     print("  No frames available to save")
+
+            elif key == ord("c") or key == ord("C"):
+                show_coverage = not show_coverage
+                print(f"  Coverage overlay: {'ON' if show_coverage else 'OFF'}")
+                if show_coverage:
+                    print(coverage.report(cam_names))
 
             elif key == ord("q") or key == ord("Q"):
                 break
@@ -350,6 +477,16 @@ def run_capture_mode(cfg: dict, args) -> str:
         json.dump(meta, f, indent=2)
 
     print(f"\nCapture complete: {frame_idx} frame sets in {capture_dir}/")
+    report = coverage.report(cam_names)
+    if report:
+        print("\nCorner coverage analysis:")
+        print(report)
+        # Warn if any camera has poor coverage
+        for idx in cam_indices:
+            if coverage.coverage_fraction(idx) < 0.8:
+                print(f"\n  ** TIP: Move the board to the RED regions and capture more frames.")
+                print(f"  ** Press C during capture to toggle coverage overlay.")
+                break
     return capture_dir
 
 
@@ -363,26 +500,60 @@ def calibrate_intrinsics(
     cam_idx: int,
     cam_name: str,
     distortion_model: str = "radtan",
+    quiet: bool = False,
 ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray],
-           Optional[Tuple[int, int]], float, List[int]]:
+           Optional[Tuple[int, int]], float, List[int], str]:
     """Calibrate a single camera's intrinsics.
 
-    Returns (K, D, image_size, rms, used_frame_indices) or Nones on failure.
-    K is 3x3, D shape depends on distortion_model.
+    Returns (K, D, image_size, rms, used_frame_indices, selected_model)
+    or Nones on failure.  K is 3x3, D shape depends on distortion_model.
+
+    If distortion_model is "auto", tries radtan, fisheye, and rational
+    models and picks the one with the lowest RMS.
     """
+    if distortion_model == "auto":
+        candidates = ["radtan", "fisheye", "rational"]
+        best_result = None
+        best_rms = float("inf")
+        best_model = "radtan"
+        print(f"  [cam{cam_idx}] Auto model selection — trying {candidates}")
+        for model_name in candidates:
+            K_c, D_c, sz_c, rms_c, used_c, _ = calibrate_intrinsics(
+                image_dir, board, cam_idx, cam_name, model_name, quiet=True)
+            if K_c is not None and 0 < rms_c < best_rms:
+                best_rms = rms_c
+                best_model = model_name
+                best_result = (K_c, D_c, sz_c, rms_c, used_c)
+            tag = "  <-- best" if (K_c is not None and rms_c == best_rms) else ""
+            rms_str = f"{rms_c:.4f}" if rms_c > 0 else "FAIL"
+            print(f"    {model_name:<10} RMS={rms_str}{tag}")
+        if best_result is None:
+            return None, None, None, -1.0, [], "auto"
+        K, D, image_size, rms, used_indices = best_result
+        print(f"  [cam{cam_idx}] Selected model: {best_model} (RMS={rms:.4f})")
+        # Print final intrinsic summary
+        print(f"  [cam{cam_idx}] model={best_model} "
+              f"Intrinsic RMS = {rms:.4f}  "
+              f"fx={K[0,0]:.1f} fy={K[1,1]:.1f} "
+              f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}  "
+              f"D=[{', '.join(f'{x:.4f}' for x in D.flatten())}]")
+        return K, D, image_size, rms, used_indices, best_model
+
     model_info = DISTORTION_MODELS[distortion_model]
     subpix_win = model_info["subpix_window"]
 
     cam_dir = os.path.join(image_dir, f"cam{cam_idx}_{cam_name}")
     if not os.path.isdir(cam_dir):
-        print(f"  [cam{cam_idx}] Directory not found: {cam_dir}")
-        return None, None, None, -1.0, []
+        if not quiet:
+            print(f"  [cam{cam_idx}] Directory not found: {cam_dir}")
+        return None, None, None, -1.0, [], distortion_model
 
     files = sorted(f for f in os.listdir(cam_dir)
                    if f.startswith("frame_") and f.endswith(".png"))
     if not files:
-        print(f"  [cam{cam_idx}] No frame images found in {cam_dir}")
-        return None, None, None, -1.0, []
+        if not quiet:
+            print(f"  [cam{cam_idx}] No frame images found in {cam_dir}")
+        return None, None, None, -1.0, [], distortion_model
 
     objp = board.object_points()
     obj_pts_list: List[np.ndarray] = []
@@ -412,11 +583,37 @@ def calibrate_intrinsics(
             img_pts_list.append(corners)
             used_indices.append(fidx)
 
-    print(f"  [cam{cam_idx}] Detected board in {len(used_indices)}/{len(files)} images")
+    if not quiet:
+        print(f"  [cam{cam_idx}] Detected board in {len(used_indices)}/{len(files)} images")
 
     if len(obj_pts_list) < 5:
-        print(f"  [cam{cam_idx}] Not enough detections (need >= 5)")
-        return None, None, image_size, -1.0, used_indices
+        if not quiet:
+            print(f"  [cam{cam_idx}] Not enough detections (need >= 5)")
+        return None, None, image_size, -1.0, used_indices, distortion_model
+
+    # Coverage analysis: check if corners span the full image area
+    if not quiet and image_size is not None:
+        cov = CoverageTracker()
+        for pts in img_pts_list:
+            cov.update(0, pts, image_size)
+        pct = cov.coverage_fraction(0) * 100
+        if pct < 80:
+            grid = cov._hits.get(0, np.zeros((_COVERAGE_GRID, _COVERAGE_GRID)))
+            # Show which regions are empty
+            empty = []
+            labels = {0: "top", _COVERAGE_GRID - 1: "bottom"}
+            clabels = {0: "left", _COVERAGE_GRID - 1: "right"}
+            for ri in range(_COVERAGE_GRID):
+                for ci in range(_COVERAGE_GRID):
+                    if grid[ri, ci] == 0:
+                        rl = labels.get(ri, "mid")
+                        cl = clabels.get(ci, "center")
+                        empty.append(f"{rl}-{cl}")
+            print(f"  [cam{cam_idx}] WARNING: corner coverage = {pct:.0f}% "
+                  f"(need >=80% for good edge accuracy)")
+            if len(empty) <= 8:
+                print(f"  [cam{cam_idx}]   Uncovered: {', '.join(empty)}")
+            print(f"  [cam{cam_idx}]   -> Capture more frames with board at image edges/corners!")
 
     if distortion_model == "fisheye":
         # cv2.fisheye requires (1, N, 3) float64 and (1, N, 2) float64
@@ -424,11 +621,131 @@ def calibrate_intrinsics(
                         for o in obj_pts_list]
         img_pts_fish = [p.reshape(1, -1, 2).astype(np.float64)
                         for p in img_pts_list]
-        K = np.eye(3, dtype=np.float64)
-        D = np.zeros((4, 1), dtype=np.float64)
-        flags = model_info["cv_flags"]
-        rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
-            obj_pts_fish, img_pts_fish, image_size, K, D, flags=flags)
+
+        # Bootstrap: use pinhole calibration to get a good initial K estimate.
+        # cv2.fisheye.calibrate is very sensitive to K initialization; without
+        # this, it fails when the board covers only the central image region.
+        # However, for very wide-FOV fisheye lenses where the board extends
+        # into heavily distorted regions, pinhole grossly overestimates fx.
+        # In that case, fall back to a heuristic estimate.
+        w, h = image_size
+        _, K_init, _, _, _ = cv2.calibrateCamera(
+            obj_pts_list, img_pts_list, image_size, None, None)
+        fx_ph = K_init[0, 0]
+        fx_max = w * 0.45  # fisheye fx is always < image_width * 0.5
+        if fx_ph > fx_max or fx_ph < w * 0.1:
+            # Pinhole estimate is unreliable; use heuristic for fisheye
+            fx_ph = w * 0.3
+            cx, cy = w / 2.0, h / 2.0
+        else:
+            cx, cy = K_init[0, 2], K_init[1, 2]
+        K_boot = np.array([[fx_ph, 0, cx],
+                           [0, fx_ph, cy],
+                           [0, 0, 1]], dtype=np.float64)
+        D_boot = np.zeros((4, 1), dtype=np.float64)
+
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                    300, 1e-6)
+        n_orig = len(obj_pts_fish)
+        max_drop = max(n_orig // 3, 5)
+        min_keep = max(15, n_orig // 2)
+
+        # Multi-stage fisheye calibration with progressive refinement:
+        #  Stage 1: FIX_K3+FIX_K4 (only k1, k2) — most stable
+        #  Stage 2: FIX_K4 only (k1, k2, k3) — intermediate
+        #  Stage 3: All D free — full model
+        # Each stage uses the result of the previous as initial guess.
+        stages = [
+            ("2-param", cv2.fisheye.CALIB_FIX_K3 | cv2.fisheye.CALIB_FIX_K4),
+            ("3-param", cv2.fisheye.CALIB_FIX_K4),
+            ("4-param", 0),
+        ]
+        base_flags = (cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+                      | cv2.fisheye.CALIB_USE_INTRINSIC_GUESS
+                      | cv2.fisheye.CALIB_FIX_SKEW)
+
+        K = K_boot.copy()
+        D = D_boot.copy()
+        total_dropped = 0
+
+        for stage_name, stage_extra in stages:
+            flags = base_flags | stage_extra
+            try:
+                K_try, D_try = K.copy(), D.copy()
+                rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
+                    obj_pts_fish, img_pts_fish, image_size,
+                    K_try, D_try, flags=flags, criteria=criteria)
+            except cv2.error:
+                # Use CHECK_COND to filter ill-conditioned frames, but
+                # limit the number of drops to avoid losing too much data.
+                check_flags = flags | cv2.fisheye.CALIB_CHECK_COND
+                while (len(obj_pts_fish) >= min_keep
+                       and total_dropped < max_drop):
+                    try:
+                        K_try, D_try = K.copy(), D.copy()
+                        rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
+                            obj_pts_fish, img_pts_fish, image_size,
+                            K_try, D_try, flags=check_flags,
+                            criteria=criteria)
+                        break
+                    except cv2.error as e:
+                        m = re.search(r'input array (\d+)', str(e))
+                        idx = int(m.group(1)) if m else len(obj_pts_fish) - 1
+                        obj_pts_fish.pop(idx)
+                        img_pts_fish.pop(idx)
+                        used_indices.pop(idx)
+                        total_dropped += 1
+                else:
+                    # Hit drop limit or min-frame limit — retry without
+                    # CHECK_COND (accept higher condition number)
+                    try:
+                        K_try, D_try = K.copy(), D.copy()
+                        rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
+                            obj_pts_fish, img_pts_fish, image_size,
+                            K_try, D_try, flags=flags, criteria=criteria)
+                    except cv2.error:
+                        if not quiet:
+                            print(f"  [cam{cam_idx}] Fisheye calibration failed "
+                                  f"at stage {stage_name}")
+                        return None, None, image_size, -1.0, used_indices, distortion_model
+
+        if total_dropped and not quiet:
+            print(f"  [cam{cam_idx}] Dropped {total_dropped}/{n_orig} "
+                  f"ill-conditioned frame(s), {len(obj_pts_fish)} used")
+
+        # Outlier rejection: remove frames with high reprojection error
+        # and recalibrate for a tighter result.
+        per_frame_err = []
+        for i in range(len(obj_pts_fish)):
+            pts2d, _ = cv2.fisheye.projectPoints(
+                obj_pts_fish[i], rvecs[i], tvecs[i], K, D)
+            err = np.sqrt(np.mean(
+                (img_pts_fish[i].reshape(-1, 2) - pts2d.reshape(-1, 2))**2))
+            per_frame_err.append(err)
+        per_frame_err = np.array(per_frame_err)
+
+        if rms > 1.0 and len(obj_pts_fish) > 15:
+            thresh = max(np.median(per_frame_err) * 2.0, 1.5)
+            good_mask = per_frame_err < thresh
+            n_outlier = int((~good_mask).sum())
+            if n_outlier > 0 and good_mask.sum() >= 15:
+                obj_pts_fish = [obj_pts_fish[i] for i in range(len(obj_pts_fish)) if good_mask[i]]
+                img_pts_fish = [img_pts_fish[i] for i in range(len(img_pts_fish)) if good_mask[i]]
+                used_indices = [used_indices[i] for i in range(len(used_indices)) if good_mask[i]]
+                K_try, D_try = K.copy(), D.copy()
+                flags_refine = (cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+                                | cv2.fisheye.CALIB_USE_INTRINSIC_GUESS
+                                | cv2.fisheye.CALIB_FIX_SKEW)
+                try:
+                    rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
+                        obj_pts_fish, img_pts_fish, image_size,
+                        K_try, D_try, flags=flags_refine, criteria=criteria)
+                    if not quiet:
+                        print(f"  [cam{cam_idx}] Removed {n_outlier} outlier frame(s) "
+                              f"(thresh={thresh:.1f}px), refined RMS={rms:.4f}")
+                except cv2.error:
+                    pass  # keep previous result
+
         D = D.flatten()[:4].reshape(1, 4)
     else:
         # Pinhole models: radtan or rational
@@ -438,12 +755,13 @@ def calibrate_intrinsics(
         n = model_info["num_coeffs"]
         D = D.flatten()[:n].reshape(1, n)
 
-    print(f"  [cam{cam_idx}] model={distortion_model} "
-          f"Intrinsic RMS = {rms:.4f}  "
-          f"fx={K[0,0]:.1f} fy={K[1,1]:.1f} "
-          f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}  "
-          f"D=[{', '.join(f'{x:.4f}' for x in D.flatten())}]")
-    return K, D, image_size, rms, used_indices
+    if not quiet:
+        print(f"  [cam{cam_idx}] model={distortion_model} "
+              f"Intrinsic RMS = {rms:.4f}  "
+              f"fx={K[0,0]:.1f} fy={K[1,1]:.1f} "
+              f"cx={K[0,2]:.1f} cy={K[1,2]:.1f}  "
+              f"D=[{', '.join(f'{x:.4f}' for x in D.flatten())}]")
+    return K, D, image_size, rms, used_indices, distortion_model
 
 
 # ---------------------------------------------------------------------------
@@ -511,14 +829,17 @@ def _stereo_via_solvepnp(
     if len(Rs) < 3:
         return None, None, -1.0
 
-    # Average rotation via Rodrigues mean
-    rvecs = [cv2.Rodrigues(R)[0] for R in Rs]
-    mean_rvec = np.mean(rvecs, axis=0)
-    R_mean, _ = cv2.Rodrigues(mean_rvec)
-    T_mean = np.mean(Ts, axis=0)
+    # Robust rotation averaging via median of Rodrigues vectors
+    rvecs = np.array([cv2.Rodrigues(R)[0].flatten() for R in Rs])
+    Ts_arr = np.array([t.flatten() for t in Ts])
+
+    # Use median for robustness against outlier frames
+    median_rvec = np.median(rvecs, axis=0).reshape(3, 1)
+    R_median, _ = cv2.Rodrigues(median_rvec)
+    T_median = np.median(Ts_arr, axis=0).reshape(3, 1)
 
     rms = float(np.sqrt(total_err / total_pts)) if total_pts > 0 else -1.0
-    return R_mean, T_mean, rms
+    return R_median, T_median, rms
 
 
 # ---------------------------------------------------------------------------
@@ -748,13 +1069,30 @@ def _visualize_stereo_rectification(
     Only works for same-model pairs (both pinhole or both fisheye).
     """
     if model == "fisheye":
+        # Get rectification rotations R1, R2 from stereoRectify.
+        # These ensure epipolar lines become horizontal.
         R1, R2, P1, P2, Q = cv2.fisheye.stereoRectify(
             K_ref, D_ref, K_tgt, D_tgt, size_ref, R, T.reshape(3, 1),
-            flags=cv2.CALIB_ZERO_DISPARITY)
+            flags=cv2.CALIB_ZERO_DISPARITY,
+            newImageSize=size_ref, balance=0.0)
+
+        # Problem: P from stereoRectify maps the full fisheye FOV (120-140°)
+        # to a rectilinear projection, producing extreme stretching → wedge-
+        # shaped output.  Instead, build a shared new camera matrix with
+        # the original focal length.  This keeps the central ~90° FOV
+        # rectified and viewable, with the same K for both cameras so
+        # horizontal scanlines stay aligned.
+        w_ref, h_ref = size_ref
+        avg_f = (K_ref[0, 0] + K_ref[1, 1] +
+                 K_tgt[0, 0] + K_tgt[1, 1]) / 4.0
+        new_K = np.array([[avg_f, 0, w_ref / 2.0],
+                          [0, avg_f, h_ref / 2.0],
+                          [0, 0, 1]], dtype=np.float64)
+
         map1_ref, map2_ref = cv2.fisheye.initUndistortRectifyMap(
-            K_ref, D_ref, R1, P1, size_ref, cv2.CV_16SC2)
+            K_ref, D_ref, R1, new_K, size_ref, cv2.CV_16SC2)
         map1_tgt, map2_tgt = cv2.fisheye.initUndistortRectifyMap(
-            K_tgt, D_tgt, R2, P2, size_tgt, cv2.CV_16SC2)
+            K_tgt, D_tgt, R2, new_K, size_tgt, cv2.CV_16SC2)
     else:
         R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
             K_ref, D_ref, K_tgt, D_tgt, size_ref, R, T.reshape(3, 1),
@@ -966,18 +1304,34 @@ def calibrate_extrinsics(
             flags=flags,
         )
     elif both_fisheye:
-        obj_fish = [o.reshape(1, -1, 3) for o in obj_pts_list]
-        img_ref_fish = [p.reshape(1, -1, 1, 2) for p in img_pts_ref]
-        img_tgt_fish = [p.reshape(1, -1, 1, 2) for p in img_pts_tgt]
-        flags = cv2.fisheye.CALIB_FIX_INTRINSIC
-        rms, _, _, _, _, R, T = cv2.fisheye.stereoCalibrate(
-            obj_fish,
-            img_ref_fish, img_tgt_fish,
-            ref_K, ref_D,
-            tgt_K, tgt_D,
-            ref_size,
-            flags=flags,
-        )
+        obj_fish = [o.reshape(1, -1, 3).astype(np.float64) for o in obj_pts_list]
+        img_ref_fish = [p.reshape(1, -1, 2).astype(np.float64) for p in img_pts_ref]
+        img_tgt_fish = [p.reshape(1, -1, 2).astype(np.float64) for p in img_pts_tgt]
+
+        # When resolutions differ, cv2.fisheye.stereoCalibrate's single
+        # imageSize parameter can mislead the initial pose guess.  Use
+        # solvePnP-based estimation which handles each camera independently.
+        if ref_size != tgt_size:
+            print(f"  [cam{ref_idx}<->cam{tgt_idx}] Cross-resolution fisheye "
+                  f"({ref_size} vs {tgt_size}), using solvePnP approach")
+            R, T, rms = _stereo_via_solvepnp(
+                obj_pts_list, img_pts_ref, img_pts_tgt,
+                ref_K, ref_D, ref_model,
+                tgt_K, tgt_D, tgt_model,
+            )
+        else:
+            flags = cv2.fisheye.CALIB_FIX_INTRINSIC
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER,
+                        200, 1e-6)
+            rms, _, _, _, _, R, T, *_ = cv2.fisheye.stereoCalibrate(
+                obj_fish,
+                img_ref_fish, img_tgt_fish,
+                ref_K, ref_D.reshape(4, 1).astype(np.float64),
+                tgt_K, tgt_D.reshape(4, 1).astype(np.float64),
+                ref_size,
+                flags=flags,
+                criteria=criteria,
+            )
     else:
         # Mixed models: fall back to solvePnP-based estimation
         print(f"  [cam{ref_idx}<->cam{tgt_idx}] Mixed models "
@@ -987,11 +1341,80 @@ def calibrate_extrinsics(
             ref_K, ref_D, ref_model,
             tgt_K, tgt_D, tgt_model,
         )
-        if R is not None:
-            print(f"  [cam{ref_idx}<->cam{tgt_idx}] Stereo RMS = {rms:.4f}")
-        return R, T, rms
+
+    if R is None:
+        print(f"  [cam{ref_idx}<->cam{tgt_idx}] Stereo calibration FAILED")
+        return None, None, -1.0
 
     print(f"  [cam{ref_idx}<->cam{tgt_idx}] Stereo RMS = {rms:.4f}")
+
+    # ---- Outlier rejection: remove high-error frames and recalibrate ----
+    if rms > 0.8 and common_count > 10:
+        per_frame_err = []
+        for i in range(len(obj_pts_list)):
+            ok1, rv1, tv1 = _solvepnp_pose(
+                obj_pts_list[i], img_pts_ref[i], ref_K, ref_D, ref_model)
+            ok2, rv2, tv2 = _solvepnp_pose(
+                obj_pts_list[i], img_pts_tgt[i], tgt_K, tgt_D, tgt_model)
+            if not ok1 or not ok2:
+                per_frame_err.append(float("inf"))
+                continue
+            # Reproject error on target camera
+            if tgt_model == "fisheye":
+                proj, _ = cv2.fisheye.projectPoints(
+                    obj_pts_list[i].reshape(1, -1, 3).astype(np.float64),
+                    rv2, tv2, tgt_K, tgt_D)
+                proj = proj.reshape(-1, 2)
+            else:
+                proj, _ = cv2.projectPoints(obj_pts_list[i], rv2, tv2, tgt_K, tgt_D)
+                proj = proj.reshape(-1, 2)
+            err = np.sqrt(np.mean(
+                (img_pts_tgt[i].reshape(-1, 2) - proj) ** 2))
+            per_frame_err.append(float(err))
+
+        per_frame_err = np.array(per_frame_err)
+        median_err = np.median(per_frame_err[np.isfinite(per_frame_err)])
+        thresh = max(median_err * 2.5, 1.5)
+        good_mask = per_frame_err < thresh
+        n_outlier = int((~good_mask).sum())
+
+        if n_outlier > 0 and good_mask.sum() >= 5:
+            obj_good = [obj_pts_list[i] for i in range(len(obj_pts_list)) if good_mask[i]]
+            ref_good = [img_pts_ref[i] for i in range(len(img_pts_ref)) if good_mask[i]]
+            tgt_good = [img_pts_tgt[i] for i in range(len(img_pts_tgt)) if good_mask[i]]
+            print(f"  [cam{ref_idx}<->cam{tgt_idx}] Removing {n_outlier} outlier frame(s) "
+                  f"(thresh={thresh:.1f}px), {len(obj_good)} kept")
+
+            # Re-run stereo calibration on filtered data
+            if both_pinhole:
+                try:
+                    rms2, _, _, _, _, R2, T2, _, _ = cv2.stereoCalibrate(
+                        obj_good, ref_good, tgt_good,
+                        ref_K, ref_d_pad.reshape(1, -1),
+                        tgt_K, tgt_d_pad.reshape(1, -1),
+                        ref_size, criteria=criteria, flags=cv2.CALIB_FIX_INTRINSIC |
+                        (cv2.CALIB_RATIONAL_MODEL if max_len > 5 else 0))
+                    R, T, rms = R2, T2, rms2
+                    print(f"  [cam{ref_idx}<->cam{tgt_idx}] Refined stereo RMS = {rms:.4f}")
+                except cv2.error:
+                    pass
+            elif both_fisheye:
+                R2, T2, rms2 = _stereo_via_solvepnp(
+                    obj_good, ref_good, tgt_good,
+                    ref_K, ref_D, ref_model,
+                    tgt_K, tgt_D, tgt_model)
+                if R2 is not None and rms2 < rms:
+                    R, T, rms = R2, T2, rms2
+                    print(f"  [cam{ref_idx}<->cam{tgt_idx}] Refined stereo RMS = {rms:.4f}")
+            else:
+                R2, T2, rms2 = _stereo_via_solvepnp(
+                    obj_good, ref_good, tgt_good,
+                    ref_K, ref_D, ref_model,
+                    tgt_K, tgt_D, tgt_model)
+                if R2 is not None and rms2 < rms:
+                    R, T, rms = R2, T2, rms2
+                    print(f"  [cam{ref_idx}<->cam{tgt_idx}] Refined stereo RMS = {rms:.4f}")
+
     return R, T, rms
 
 
@@ -1335,6 +1758,69 @@ def verify_baseline(
     return pair_results
 
 
+def _visualize_undistort_sidebyside(
+    img_a: np.ndarray, img_b: np.ndarray,
+    K_a: np.ndarray, D_a: np.ndarray, model_a: str,
+    size_a: Tuple[int, int],
+    K_b: np.ndarray, D_b: np.ndarray, model_b: str,
+    size_b: Tuple[int, int],
+    save_path: str,
+    ref_label: str = "cam_a",
+    tgt_label: str = "cam_b",
+    num_lines: int = 20,
+):
+    """Undistort each camera independently and show side-by-side with scanlines.
+
+    Used when the two cameras have different distortion models (mixed pair)
+    so stereoRectify cannot be used.
+    """
+    def _undistort_image(img, K, D, model, size):
+        if model == "fisheye":
+            new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                K, D, size, np.eye(3), balance=1.0)
+            if new_K[0, 0] < 1.0 or new_K[1, 1] < 1.0:
+                new_K = K.copy()
+            m1, m2 = cv2.fisheye.initUndistortRectifyMap(
+                K, D, np.eye(3), new_K, size, cv2.CV_16SC2)
+            return cv2.remap(img, m1, m2, cv2.INTER_LINEAR)
+        else:
+            new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, size, 1, size)
+            return cv2.undistort(img, K, D, None, new_K)
+
+    ud_a = _undistort_image(img_a, K_a, D_a, model_a, size_a)
+    ud_b = _undistort_image(img_b, K_b, D_b, model_b, size_b)
+
+    # Scale to same height
+    h_a, w_a = ud_a.shape[:2]
+    h_b, w_b = ud_b.shape[:2]
+    target_h = max(h_a, h_b)
+    if h_a != target_h:
+        s = target_h / h_a
+        ud_a = cv2.resize(ud_a, (int(w_a * s), target_h))
+    if h_b != target_h:
+        s = target_h / h_b
+        ud_b = cv2.resize(ud_b, (int(w_b * s), target_h))
+
+    vw_a = ud_a.shape[1]
+    vw_b = ud_b.shape[1]
+    canvas = np.zeros((target_h, vw_a + vw_b, 3), dtype=np.uint8)
+    canvas[:, :vw_a] = ud_a
+    canvas[:, vw_a:] = ud_b
+
+    for i in range(num_lines):
+        y = int(target_h * (i + 1) / (num_lines + 1))
+        color = (0, 255, 255) if i % 2 == 0 else (255, 255, 0)
+        cv2.line(canvas, (0, y), (vw_a + vw_b, y), color, 1)
+
+    cv2.putText(canvas, f"{ref_label} (undistorted)", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    cv2.putText(canvas, f"{tgt_label} (undistorted)", (vw_a + 10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    cv2.imwrite(save_path, canvas)
+
+
 def _try_stereo_rectify(
     capture_dir: str, vis_dir: str, board: BoardSpec,
     intrinsics: Dict[int, dict], extrinsics: Dict[int, dict],
@@ -1342,13 +1828,21 @@ def _try_stereo_rectify(
     idx_a: int, idx_b: int,
     ref_cam: int,
 ):
-    """Try to compute and visualize stereo rectification for a same-model pair."""
+    """Try to compute and visualize stereo rectification for a camera pair.
+
+    Works for same-model pairs (pinhole or fisheye stereoRectify).
+    For mixed-model pairs, falls back to per-camera undistortion overlay.
+    """
     if idx_a not in intrinsics or idx_b not in intrinsics:
         return
-    if intrinsics[idx_a]["model"] != intrinsics[idx_b]["model"]:
-        return
 
-    model = intrinsics[idx_a]["model"]
+    model_a = intrinsics[idx_a]["model"]
+    model_b = intrinsics[idx_b]["model"]
+    mixed_models = (model_a != model_b)
+
+    # For stereoRectify, both must use the same model. For mixed models,
+    # we fall through to a simpler per-camera undistortion visualization.
+    model = model_a  # used for stereoRectify when models match
     K_a = intrinsics[idx_a]["K"]
     D_a = intrinsics[idx_a]["D"]
     K_b = intrinsics[idx_b]["K"]
@@ -1384,6 +1878,9 @@ def _try_stereo_rectify(
     if not os.path.isdir(dir_a) or not os.path.isdir(dir_b):
         return
 
+    model_info_a = DISTORTION_MODELS[model_a]
+    model_info_b = DISTORTION_MODELS[model_b]
+
     files = sorted(f for f in os.listdir(dir_a)
                    if f.startswith("frame_") and f.endswith(".png"))
     for fname in files:
@@ -1397,30 +1894,46 @@ def _try_stereo_rectify(
             continue
 
         # Verify both have detectable boards (ensures good frame)
-        model_info = DISTORTION_MODELS[model]
         found_a, _ = detect_chessboard(
             img_a, board.pattern_size,
-            subpix_window=model_info["subpix_window"])
+            subpix_window=model_info_a["subpix_window"])
         found_b, _ = detect_chessboard(
             img_b, board.pattern_size,
-            subpix_window=model_info["subpix_window"])
+            subpix_window=model_info_b["subpix_window"])
         if not found_a or not found_b:
             continue
 
         rect_path = os.path.join(
             vis_dir, f"rectified_cam{idx_a}_cam{idx_b}.png")
-        try:
-            _visualize_stereo_rectification(
-                img_a, img_b,
-                K_a, D_a, K_b, D_b,
-                R_ab, T_ab, size_a, size_b, model,
-                rect_path,
-                ref_label=f"cam{idx_a}({name_a})",
-                tgt_label=f"cam{idx_b}({name_b})",
-            )
-            print(f"  Saved rectification: {rect_path}")
-        except Exception as e:
-            print(f"  Rectification failed for cam{idx_a}<->cam{idx_b}: {e}")
+
+        if mixed_models:
+            # Mixed distortion models: cannot use stereoRectify.
+            # Fall back to per-camera undistortion side-by-side.
+            try:
+                _visualize_undistort_sidebyside(
+                    img_a, img_b,
+                    K_a, D_a, model_a, size_a,
+                    K_b, D_b, model_b, size_b,
+                    rect_path,
+                    ref_label=f"cam{idx_a}({name_a}) [{model_a}]",
+                    tgt_label=f"cam{idx_b}({name_b}) [{model_b}]",
+                )
+                print(f"  Saved undistort comparison (mixed models): {rect_path}")
+            except Exception as e:
+                print(f"  Undistort viz failed for cam{idx_a}<->cam{idx_b}: {e}")
+        else:
+            try:
+                _visualize_stereo_rectification(
+                    img_a, img_b,
+                    K_a, D_a, K_b, D_b,
+                    R_ab, T_ab, size_a, size_b, model,
+                    rect_path,
+                    ref_label=f"cam{idx_a}({name_a})",
+                    tgt_label=f"cam{idx_b}({name_b})",
+                )
+                print(f"  Saved rectification: {rect_path}")
+            except Exception as e:
+                print(f"  Rectification failed for cam{idx_a}<->cam{idx_b}: {e}")
         return  # Only need one frame
 
 
@@ -1454,7 +1967,7 @@ def run_calibrate_mode(cfg: dict, args) -> Optional[str]:
         if not c.get("enabled", True):
             continue
         model = c.get("distortion_model", "radtan")
-        if model not in DISTORTION_MODELS:
+        if model != "auto" and model not in DISTORTION_MODELS:
             print(f"Warning: unknown distortion_model '{model}' for "
                   f"cam{c['index']}, falling back to 'radtan'")
             model = "radtan"
@@ -1477,19 +1990,74 @@ def run_calibrate_mode(cfg: dict, args) -> Optional[str]:
         name = cam_names.get(idx, f"cam{idx}")
         model = cam_models.get(idx, "radtan")
         print(f"\nCalibrating cam{idx} ({name}) model={model}...")
-        K, D, img_size, rms, used = calibrate_intrinsics(
+        K, D, img_size, rms, used, selected_model = calibrate_intrinsics(
             capture_dir, board, idx, name, distortion_model=model)
         if K is None:
             print(f"  FAILED - skipping cam{idx}")
             continue
+        # Update model map with auto-selected model
+        if model == "auto":
+            cam_models[idx] = selected_model
         intrinsics[idx] = {
             "K": K, "D": D, "image_size": img_size,
-            "rms": rms, "used_frames": used, "model": model,
+            "rms": rms, "used_frames": used, "model": selected_model,
         }
 
     if ref_cam not in intrinsics:
         print(f"\nError: Reference camera cam{ref_cam} calibration failed.")
         return None
+
+    # ---- Step 1b: Unify auto-selected models for same-sensor cameras ----
+    # Cameras sharing the same sensor (e.g. ov9281_0, ov9281_1 → "ov9281")
+    # must use the same distortion model.  Pick the model with the lowest
+    # average RMS across the group.
+    _auto_indices = [c["index"] for c in cam_cfgs
+                     if c.get("enabled", True)
+                     and c.get("distortion_model", "radtan") == "auto"]
+    if _auto_indices:
+        # Group by sensor base name: strip trailing _0, _1, etc.
+        sensor_groups: Dict[str, List[int]] = {}
+        for idx in _auto_indices:
+            if idx not in intrinsics:
+                continue
+            name = cam_names.get(idx, f"cam{idx}")
+            # "ov9281_0" → "ov9281", "imx334_1" → "imx334"
+            base = re.sub(r'_\d+$', '', name)
+            sensor_groups.setdefault(base, []).append(idx)
+
+        for base, indices in sensor_groups.items():
+            if len(indices) <= 1:
+                continue
+            # All cameras in this group should use the same model.
+            # Pick the model with the lowest RMS among them.
+            best_model = None
+            best_rms = float("inf")
+            for idx in indices:
+                m = intrinsics[idx]["model"]
+                r = intrinsics[idx]["rms"]
+                if r < best_rms:
+                    best_rms = r
+                    best_model = m
+            # Check if they already agree
+            models_in_group = set(intrinsics[i]["model"] for i in indices)
+            if len(models_in_group) == 1:
+                continue
+            print(f"\n  Sensor group '{base}': models differ {dict((cam_names[i], intrinsics[i]['model']) for i in indices)}")
+            print(f"  Unifying to '{best_model}' (lowest RMS={best_rms:.4f})")
+            # Re-calibrate the cameras that got a different model
+            for idx in indices:
+                if intrinsics[idx]["model"] == best_model:
+                    continue
+                name = cam_names.get(idx, f"cam{idx}")
+                print(f"  Re-calibrating cam{idx} ({name}) with model={best_model}...")
+                K, D, img_size, rms, used, sel = calibrate_intrinsics(
+                    capture_dir, board, idx, name, distortion_model=best_model)
+                if K is not None:
+                    cam_models[idx] = best_model
+                    intrinsics[idx] = {
+                        "K": K, "D": D, "image_size": img_size,
+                        "rms": rms, "used_frames": used, "model": best_model,
+                    }
 
     # ---- Step 2: Extrinsic calibration (cam0 <-> camN) ----
     print("\n" + "=" * 60)

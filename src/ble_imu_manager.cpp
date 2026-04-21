@@ -1385,7 +1385,7 @@ void BleImuManager::on_imu_notify(BleDevice &dev, GVariant *params)
 
     gsize n = 0;
     const uint8_t *buf = (const uint8_t *)g_variant_get_fixed_array(val, &n, 1);
-    if (n != 32) {
+    if (n == 0 || n % 32 != 0) {
         WARN("[%s] Unexpected IMU packet length %zu", dev.name.c_str(), n);
         g_variant_unref(val);
         g_variant_unref(changed);
@@ -1394,37 +1394,43 @@ void BleImuManager::on_imu_notify(BleDevice &dev, GVariant *params)
 
     dev.last_imu_ms = monotonic_ms();
 
-    ImuSample sample{};
-    bool became_ready = false;
-    int serial_index = -1;
-    ZmqStreamer *streamer = nullptr;
+    const int frame_count = (int)(n / 32);
 
-    {
-        std::lock_guard<std::mutex> lk(outputs_mu_);
-        OutputChannel *out = find_output(dev.role);
-        if (out) {
-            sample.timestamp_ns = expand_timestamp_ms(*out, unpack_u32_le(buf + 28)) * 1000000ULL;
-            sample.accel[0] = unpack_float_le(buf + 0);
-            sample.accel[1] = unpack_float_le(buf + 4);
-            sample.accel[2] = unpack_float_le(buf + 8);
-            sample.gyro[0] = unpack_float_le(buf + 12) * kDegToRad;
-            sample.gyro[1] = unpack_float_le(buf + 16) * kDegToRad;
-            sample.gyro[2] = unpack_float_le(buf + 20) * kDegToRad;
-            became_ready = !out->ready;
-            out->ready = true;
-            out->alarm_active = false;
-            serial_index = out->cfg.serial_index;
-            streamer = out->streamer.get();
+    for (int fi = 0; fi < frame_count; ++fi) {
+        const uint8_t *frame = buf + fi * 32;
+
+        ImuSample sample{};
+        bool became_ready = false;
+        int serial_index = -1;
+        ZmqStreamer *streamer = nullptr;
+
+        {
+            std::lock_guard<std::mutex> lk(outputs_mu_);
+            OutputChannel *out = find_output(dev.role);
+            if (out) {
+                sample.timestamp_ns = expand_timestamp_ms(*out, unpack_u32_le(frame + 28)) * 1000000ULL;
+                sample.accel[0] = unpack_float_le(frame + 0);
+                sample.accel[1] = unpack_float_le(frame + 4);
+                sample.accel[2] = unpack_float_le(frame + 8);
+                sample.gyro[0] = unpack_float_le(frame + 12) * kDegToRad;
+                sample.gyro[1] = unpack_float_le(frame + 16) * kDegToRad;
+                sample.gyro[2] = unpack_float_le(frame + 20) * kDegToRad;
+                became_ready = !out->ready;
+                out->ready = true;
+                out->alarm_active = false;
+                serial_index = out->cfg.serial_index;
+                streamer = out->streamer.get();
+            }
         }
-    }
 
-    if (became_ready)
-        update_connection_audio();
+        if (became_ready)
+            update_connection_audio();
 
-    if (active_mode_.load() && streamer) {
-        streamer->send((const uint8_t *)&sample, sizeof(sample));
-        if (recorder_.is_recording())
-            recorder_.push_serial_imu(serial_index, sample);
+        if (active_mode_.load() && streamer) {
+            streamer->send((const uint8_t *)&sample, sizeof(sample));
+            if (recorder_.is_recording())
+                recorder_.push_serial_imu(serial_index, sample);
+        }
     }
 
     g_variant_unref(val);
