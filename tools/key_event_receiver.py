@@ -5,10 +5,11 @@
 订阅 quad_cam_streamer 的按键事件 ZMQ 端口（默认 5565），
 实时打印录制 START/STOP 状态及对应的 CLOCK_MONOTONIC 时间戳。
 
-消息格式（9 字节）：
-  [uint64_t timestamp_ns (8B LE)][uint8_t is_recording (1B)]
+消息格式（13 字节）：
+  [uint64_t timestamp_ns (8B LE)][uint8_t is_recording (1B)][uint32_t seq_num (4B LE)]
   - is_recording: 1 = START（开始录制）, 0 = STOP（停止录制）
   - timestamp_ns: CLOCK_MONOTONIC 纳秒，与 BLE 录制命令使用同一时间戳
+  - seq_num: 当前储存文件夹序号（euroc_NNN 中的 NNN）
 
 用法：
     python3 key_event_receiver.py
@@ -26,7 +27,7 @@ import time
 
 import zmq
 
-KEY_EVENT_MSG_SIZE = 9  # 8 (uint64 timestamp_ns) + 1 (uint8 is_recording)
+KEY_EVENT_MSG_SIZE = 13  # 8 (uint64 timestamp_ns) + 1 (uint8 is_recording) + 4 (uint32 seq_num)
 
 
 def main():
@@ -46,10 +47,10 @@ def main():
     sock.connect(addr)
 
     print(f"Listening for key events on {addr}")
-    print(f"Message format: [uint64 timestamp_ns][uint8 is_recording]")
+    print(f"Message format: [uint64 timestamp_ns][uint8 is_recording][uint32 seq_num]")
     print(f"Waiting for events... (Ctrl+C to quit)\n")
-    print(f"{'#':>4}  {'State':<8}  {'Timestamp (ns)':>20}  {'Timestamp (s)':>16}")
-    print(f"{'':->4}  {'':->8}  {'':->20}  {'':->16}")
+    print(f"{'#':>4}  {'State':<8}  {'Seq':>5}  {'Timestamp (ns)':>20}  {'Timestamp (s)':>16}")
+    print(f"{'':->4}  {'':->8}  {'':->5}  {'':->20}  {'':->16}")
 
     count = 0
 
@@ -65,12 +66,13 @@ def main():
 
             ts_ns = struct.unpack("<Q", data[:8])[0]
             is_recording = data[8] != 0
+            seq_num = struct.unpack("<I", data[9:13])[0]
             count += 1
 
             state = "START" if is_recording else "STOP"
             ts_s = ts_ns / 1e9
 
-            print(f"{count:4d}  {state:<8}  {ts_ns:>20d}  {ts_s:>16.6f}")
+            print(f"{count:4d}  {state:<8}  {seq_num:>5d}  {ts_ns:>20d}  {ts_s:>16.6f}")
 
     except KeyboardInterrupt:
         print(f"\nReceived {count} events total.")

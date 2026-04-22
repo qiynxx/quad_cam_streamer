@@ -501,7 +501,13 @@ static void camera_thread(int index, const CameraConfig &cam_cfg,
             }
         }
 
+        auto enc_start = std::chrono::steady_clock::now();
         if (encoder.encode(enc_input, buf_size, jpeg_buf)) {
+            auto enc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - enc_start).count();
+            if (frame_count % 60 == 0)
+                fprintf(stderr, "[cam%d] encode: %.2fms  jpeg=%zu KB\n",
+                        index, enc_us / 1000.0, jpeg_buf.size() / 1024);
             // Build message: [timestamp_ns (8 bytes LE)][JPEG data]
             msg_buf.resize(8 + jpeg_buf.size());
             memcpy(msg_buf.data(), &ts, 8);
@@ -916,14 +922,17 @@ int main(int argc, char *argv[])
                     }
 
                     // Publish key event on ZMQ (same timestamp for BLE and viewer)
+                    // Format: [uint64 ts_ns (8B)][uint8 is_start (1B)][uint32 seq_num (4B)]
                     {
-                        uint8_t msg[9];
+                        uint8_t msg[13];
                         memcpy(msg, &ts_ns, 8);
                         msg[8] = is_start ? 1 : 0;
+                        uint32_t seq = (uint32_t)recorder.sequence_number();
+                        memcpy(msg + 9, &seq, 4);
                         key_event_zmq.send(msg, sizeof(msg));
-                        fprintf(stderr, "[keyctl] Published key event on ZMQ: %s ts=%lu\n",
+                        fprintf(stderr, "[keyctl] Published key event on ZMQ: %s ts=%lu seq=%u\n",
                                 is_start ? "START" : "STOP",
-                                (unsigned long)ts_ns);
+                                (unsigned long)ts_ns, seq);
                     }
 
                     if (ble) {

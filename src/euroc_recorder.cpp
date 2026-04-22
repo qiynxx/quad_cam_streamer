@@ -245,6 +245,7 @@ bool EurocRecorder::start_recording()
         closedir(dir);
     }
 
+    seq_num_ = seq_num;
     char seq_str[16];
     snprintf(seq_str, sizeof(seq_str), "%03d", seq_num);
     session_dir_ = sd_path + "/euroc_" + seq_str + "/mav0";

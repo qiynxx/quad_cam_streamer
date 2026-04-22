@@ -291,19 +291,25 @@ bool V4L2Camera::set_frame_interval(int fps)
     fi.interval.numerator = 1;
     fi.interval.denominator = fps;
 
+    bool mode_selected = false;
     if (xioctl(subdev_fd_, VIDIOC_SUBDEV_S_FRAME_INTERVAL, &fi) == 0) {
         int actual_fps = (fi.interval.numerator > 0)
                          ? (int)(fi.interval.denominator / fi.interval.numerator)
                          : fps;
         LOG("Frame interval set via subdev: requested=%dfps actual=%dfps", fps, actual_fps);
-        return true;
+        if (actual_fps == fps)
+            return true;
+        // Mode fps != requested fps — fine-tune via VBLANK below
+        LOG("Actual mode fps (%d) != requested (%d), adjusting via VBLANK", actual_fps, fps);
+        mode_selected = true;
     }
 
-    // Fallback: adjust VTS via V4L2_CID_VBLANK on the subdev.
+    // Adjust VTS via V4L2_CID_VBLANK on the subdev.
     // OV9281 pixel clock = 80 MHz, HTS = 728.
     // VTS = pixel_clock / (HTS * fps)  → VBLANK = VTS - height
-    LOG("VIDIOC_SUBDEV_S_FRAME_INTERVAL not supported (%s), falling back to VBLANK",
-        strerror(errno));
+    if (!mode_selected)
+        LOG("VIDIOC_SUBDEV_S_FRAME_INTERVAL not supported (%s), falling back to VBLANK",
+            strerror(errno));
 
     if (height_ <= 0) {
         LOG("Warning: height not set, cannot compute VBLANK");

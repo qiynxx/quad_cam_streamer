@@ -21,6 +21,7 @@ public:
     ~EurocRecorder();
 
     bool is_recording() const { return recording_.load(std::memory_order_relaxed); }
+    int sequence_number() const { return seq_num_; }
 
     // Called from camera threads - enqueues JPEG data into ring buffer
     void push_frame(int cam_index, uint64_t timestamp_ns,
@@ -77,6 +78,7 @@ private:
 
     // Session directory
     std::string session_dir_;
+    int seq_num_ = 0;  // euroc_NNN sequence number
 
     // Per-camera ring buffers
     struct CamRing {

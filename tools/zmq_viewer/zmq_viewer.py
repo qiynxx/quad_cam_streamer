@@ -49,7 +49,7 @@ import zmq
 IMU_MSG_SIZE = 56  # 8 + 24 + 24 bytes
 IMU_STRUCT_FMT = "<Qdddddd"  # uint64 + 6 doubles
 FRAME_BUF_SIZE = 15  # ~500ms at 30fps, enough for network jitter
-KEY_EVENT_MSG_SIZE = 9  # 8 (uint64 timestamp_ns) + 1 (uint8 is_recording)
+KEY_EVENT_MSG_SIZE = 13  # 8 (uint64 timestamp_ns) + 1 (uint8 is_recording) + 4 (uint32 seq_num)
 
 
 def load_config():
@@ -157,7 +157,7 @@ class ImuReceiver:
 class KeyEventReceiver:
     """Background thread that receives key press events (START/STOP) via ZMQ.
 
-    Message format: [uint64_t timestamp_ns (8B LE)][uint8_t is_recording (1B)]
+    Message format: [uint64_t timestamp_ns (8B LE)][uint8_t is_recording (1B)][uint32_t seq_num (4B LE)]
     """
 
     def __init__(self, host, port):
@@ -167,6 +167,7 @@ class KeyEventReceiver:
         self.is_recording = False
         self.last_ts_ns = 0
         self.event_count = 0
+        self.seq_num = 0
         self._running = False
         self._thread = None
 
@@ -205,19 +206,21 @@ class KeyEventReceiver:
 
             ts_ns = struct.unpack("<Q", data[:8])[0]
             is_rec = data[8] != 0
+            seq = struct.unpack("<I", data[9:13])[0]
 
             with self.lock:
                 self.is_recording = is_rec
                 self.last_ts_ns = ts_ns
                 self.event_count += 1
+                self.seq_num = seq
 
         sock.close()
         ctx.term()
 
     def get_state(self):
-        """Returns (is_recording, timestamp_ns, event_count)."""
+        """Returns (is_recording, timestamp_ns, event_count, seq_num)."""
         with self.lock:
-            return self.is_recording, self.last_ts_ns, self.event_count
+            return self.is_recording, self.last_ts_ns, self.event_count, self.seq_num
 
 
 class ParamController:
@@ -971,7 +974,7 @@ def main():
 
             # Draw recording state indicator (top-center)
             if key_event_recv:
-                is_rec, rec_ts_ns, rec_count = key_event_recv.get_state()
+                is_rec, rec_ts_ns, rec_count, rec_seq = key_event_recv.get_state()
                 if rec_count > 0:
                     if is_rec:
                         rec_text = "REC"
@@ -981,8 +984,9 @@ def main():
                         rec_text = "IDLE"
                         rec_color = (200, 200, 200)
                         rec_bg = (80, 80, 80)
+                    seq_text = f"#{rec_seq:03d}" if rec_seq > 0 else ""
                     ts_text = f"ts:{rec_ts_ns/1e9:.3f}s"
-                    full_text = f"{rec_text}  {ts_text}"
+                    full_text = f"{rec_text}  {seq_text}  {ts_text}" if seq_text else f"{rec_text}  {ts_text}"
                     text_size = cv2.getTextSize(full_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
                     tx = (win_w - text_size[0]) // 2
                     # Background rectangle
@@ -1037,9 +1041,10 @@ def main():
                 sync_info = f", sync:{match_diff_ms:.2f}ms"
                 rec_info = ""
                 if key_event_recv:
-                    is_rec, _, rec_cnt = key_event_recv.get_state()
+                    is_rec, _, rec_cnt, rec_seq = key_event_recv.get_state()
                     if rec_cnt > 0:
-                        rec_info = f", {'REC' if is_rec else 'IDLE'}"
+                        seq_str = f"#{rec_seq:03d}" if rec_seq > 0 else ""
+                        rec_info = f", {'REC' if is_rec else 'IDLE'}{' ' + seq_str if seq_str else ''}"
                 print(f"FPS: {fps_str}{imu_info}{sync_info}{rec_info}")
                 for idx in cam_indices:
                     frame_counts[idx] = 0
